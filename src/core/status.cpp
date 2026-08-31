@@ -42,6 +42,8 @@ LteSkuState parse_lte_sku(std::string_view value, bool keyboard_attached)
         return LteSkuState::Present;
     if (value == "lte-probing")
         return LteSkuState::Probing;
+    if (value == "lte-pending")
+        return LteSkuState::Probing;
     if (value == "lte-not-detected" || value == "basic")
         return LteSkuState::NotDetected;
     if (value == "lte-fault")
