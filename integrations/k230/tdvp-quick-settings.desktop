@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TDVP Quick Settings
+Comment=Top-edge touch control center for the TDVP K230 desktop
+Exec=/usr/bin/tdvp-quick-settings
+OnlyShowIn=Labwc;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+

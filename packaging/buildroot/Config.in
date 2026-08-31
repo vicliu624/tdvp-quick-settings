@@ -1,0 +1,13 @@
+config BR2_PACKAGE_TDVP_QUICK_SETTINGS
+	bool "tdvp-quick-settings"
+	depends on BR2_PACKAGE_WAYLAND
+	select BR2_PACKAGE_CAIRO
+	select BR2_PACKAGE_WAYLAND_PROTOCOLS
+	help
+	  Native C++17 Wayland layer-shell Quick Settings panel for the
+	  TDVP handheld desktop. It is an optional desktop enhancement and
+	  does not replace Labwc, PCManFM, or wf-panel-pi.
+
+comment "tdvp-quick-settings needs Wayland"
+	depends on !BR2_PACKAGE_WAYLAND
+

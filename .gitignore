@@ -1,0 +1,8 @@
+build/
+build-mingw/
+build-linux-host/
+build-k230-cross/
+Testing/
+out/
+.cache/
+compile_commands.json
