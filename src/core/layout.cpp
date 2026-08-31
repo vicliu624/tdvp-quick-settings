@@ -7,6 +7,8 @@ namespace {
 
 constexpr int kTargetWidth = 1232;
 constexpr int kTargetHeight = 568;
+constexpr int kPanelReservedTopHeight = 64;
+constexpr int kAvailableHeightBelowPanel = kTargetHeight - kPanelReservedTopHeight;
 constexpr int kStatusHeight = 48;
 constexpr int kOuterMargin = 24;
 constexpr int kMainWidth = 864;
@@ -50,43 +52,56 @@ QuickSettingsLayout make_layout(Extent display, const QuickSettingsModel& model)
 {
     QuickSettingsLayout layout;
     layout.fourth_primary_tile = model.fourth_primary_tile;
-    if (display.width != kTargetWidth || display.height != kTargetHeight)
+    if (display.width != kTargetWidth ||
+        (display.height != kTargetHeight && display.height != kAvailableHeightBelowPanel))
         return layout;
+
+    const int compressed = kTargetHeight - display.height;
+    const int primary_y = kPrimaryY - (compressed * 3 / 4);
+    const int primary_height = kPrimaryHeight - (compressed * 10 / 64);
+    const int slider_y = kSliderY - (compressed * 59 / 64);
+    const int slider_height = kSliderHeight - (compressed * 13 / 64);
+    const int secondary_y = kSecondaryY - (compressed * 74 / 64);
+    const int secondary_height = kSecondaryHeight - (compressed * 6 / 64);
+    const int system_y = kSystemY - (compressed * 82 / 64);
+    const int system_height = kSystemHeight - (compressed * 6 / 64);
+    const int network_row_y = 168 - (compressed * 48 / 64);
+    const int network_settings_y = 492 - (compressed * 60 / 64);
 
     layout.supported = true;
     layout.requires_vertical_scroll = false;
     layout.status_bar = row_rect(0, 0, kTargetWidth, kStatusHeight);
-    layout.drawer = row_rect(0, kStatusHeight, kTargetWidth, kTargetHeight - kStatusHeight);
+    layout.drawer = row_rect(0, kStatusHeight, kTargetWidth, display.height - kStatusHeight);
 
     const int primary_width = (kMainWidth - (3 * kCardGap)) / 4;
     for (int index = 0; index < 4; ++index)
         layout.primary_cards[static_cast<std::size_t>(index)] =
-            row_rect(kOuterMargin + index * (primary_width + kCardGap), kPrimaryY, primary_width,
-                     kPrimaryHeight);
+            row_rect(kOuterMargin + index * (primary_width + kCardGap), primary_y, primary_width,
+                     primary_height);
 
     const int slider_width = (kMainWidth - (2 * kCardGap)) / 3;
     for (int index = 0; index < 3; ++index)
         layout.sliders[static_cast<std::size_t>(index)] =
-            row_rect(kOuterMargin + index * (slider_width + kCardGap), kSliderY, slider_width,
-                     kSliderHeight);
+            row_rect(kOuterMargin + index * (slider_width + kCardGap), slider_y, slider_width,
+                     slider_height);
 
     const int secondary_width = (kMainWidth - kCardGap) / 2;
-    layout.secondary_actions[0] = row_rect(kOuterMargin, kSecondaryY, secondary_width, kSecondaryHeight);
+    layout.secondary_actions[0] = row_rect(kOuterMargin, secondary_y, secondary_width, secondary_height);
     layout.secondary_actions[1] =
-        row_rect(kOuterMargin + secondary_width + kCardGap, kSecondaryY, secondary_width,
-                 kSecondaryHeight);
+        row_rect(kOuterMargin + secondary_width + kCardGap, secondary_y, secondary_width,
+                 secondary_height);
 
     const int system_width = (kMainWidth - (2 * kCardGap)) / 3;
     for (int index = 0; index < 3; ++index)
         layout.system_actions[static_cast<std::size_t>(index)] =
-            row_rect(kOuterMargin + index * (system_width + kCardGap), kSystemY, system_width,
-                     kSystemHeight);
+            row_rect(kOuterMargin + index * (system_width + kCardGap), system_y, system_width,
+                     system_height);
 
-    layout.network_toggle = row_rect(kNetworkX, 112, kNetworkWidth, 44);
+    layout.network_toggle = row_rect(kNetworkX, primary_y, kNetworkWidth, 44);
     for (int index = 0; index < 4; ++index)
         layout.network_rows[static_cast<std::size_t>(index)] =
-            row_rect(kNetworkX, 168 + index * 52, kNetworkWidth, 52);
-    layout.network_settings = row_rect(kNetworkX, 492, kNetworkWidth, 52);
+            row_rect(kNetworkX, network_row_y + index * 52, kNetworkWidth, 52);
+    layout.network_settings = row_rect(kNetworkX, network_settings_y, kNetworkWidth, 52);
     return layout;
 }
 
@@ -114,4 +129,3 @@ bool valid_layout(const QuickSettingsLayout& layout, Extent display)
 }
 
 }  // namespace tdvp::quick_settings
-

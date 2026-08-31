@@ -2,6 +2,7 @@
 
 #include "core/controller.hpp"
 #include "core/layout.hpp"
+#include "core/orientation.hpp"
 #include "core/state.hpp"
 #include "wayland/provider_client.hpp"
 #include "wayland/wifi_nmcli.hpp"
@@ -49,6 +50,7 @@ constexpr int kStatusHeight = 48;
 constexpr uint32_t kVersionCompositor = 4;
 constexpr uint32_t kVersionSeat = 5;
 constexpr uint32_t kVersionLayerShell = 4;
+constexpr uint32_t kVersionOutput = 2;
 
 struct Buffer {
     wl_buffer* wl = nullptr;
@@ -107,9 +109,24 @@ void draw_card(cairo_t* context, const Rect& rect, const char* title, const char
     cairo_stroke(context);
 
     cairo_set_source_rgb(context, 0.16, 0.16, 0.14);
+    if (rect.height < 52) {
+        draw_text(context, rect.x + 18.0, rect.y + std::min(34.0, rect.height - 14.0), 16.0,
+                  title, true);
+        return;
+    }
+    if (rect.height < 76) {
+        draw_text(context, rect.x + 18.0, rect.y + 25.0, 16.0, title, true);
+        if (detail[0] != '\0') {
+            cairo_set_source_rgb(context, 0.31, 0.30, 0.27);
+            draw_text(context, rect.x + 18.0, rect.y + 45.0, 13.0, detail);
+        }
+        return;
+    }
     draw_text(context, rect.x + 18.0, rect.y + 37.0, 16.0, title, true);
-    cairo_set_source_rgb(context, 0.31, 0.30, 0.27);
-    draw_text(context, rect.x + 18.0, rect.y + 64.0, 13.0, detail);
+    if (detail[0] != '\0') {
+        cairo_set_source_rgb(context, 0.31, 0.30, 0.27);
+        draw_text(context, rect.x + 18.0, rect.y + 64.0, 13.0, detail);
+    }
 }
 
 void draw_slider(cairo_t* context, const Rect& rect, const char* title, int percent)
@@ -147,18 +164,6 @@ int slider_percent(const Rect& rect, int pointer_x)
     return clamp_percent((pointer_x - start) * 100 / width);
 }
 
-std::string current_time_text()
-{
-    std::time_t now = std::time(nullptr);
-    std::tm local {};
-    if (localtime_r(&now, &local) == nullptr)
-        return "--:--";
-    char text[6] {};
-    if (std::strftime(text, sizeof(text), "%H:%M", &local) == 0U)
-        return "--:--";
-    return text;
-}
-
 void launch_session_process(const std::vector<std::string>& arguments)
 {
     if (arguments.empty())
@@ -191,6 +196,8 @@ public:
     ~Impl()
     {
         destroy_surface();
+        if (output_ != nullptr)
+            wl_output_destroy(output_);
         if (keyboard_ != nullptr)
             wl_keyboard_destroy(keyboard_);
         if (pointer_ != nullptr)
@@ -251,6 +258,16 @@ private:
         return listener;
     }
 
+    static const wl_output_listener& output_listener()
+    {
+        static wl_output_listener listener {};
+        listener.geometry = output_geometry;
+        listener.mode = output_mode;
+        listener.done = output_done;
+        listener.scale = output_scale;
+        return listener;
+    }
+
     static const wl_pointer_listener& pointer_listener()
     {
         static wl_pointer_listener listener {};
@@ -304,10 +321,42 @@ private:
             self->layer_shell_ = static_cast<zwlr_layer_shell_v1*>(
                 wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface,
                                  std::min(version, kVersionLayerShell)));
+        } else if (std::strcmp(interface, wl_output_interface.name) == 0 && self->output_ == nullptr) {
+            self->output_ = static_cast<wl_output*>(
+                wl_registry_bind(registry, name, &wl_output_interface, std::min(version, kVersionOutput)));
+            wl_output_add_listener(self->output_, &output_listener(), self);
         }
     }
 
     static void registry_remove(void*, wl_registry*, uint32_t)
+    {
+    }
+
+    static void output_geometry(void* data, wl_output*, int32_t, int32_t, int32_t, int32_t,
+                                int32_t, const char*, const char*, int32_t transform)
+    {
+        auto* self = static_cast<Impl*>(data);
+        if (transform >= WL_OUTPUT_TRANSFORM_NORMAL && transform <= WL_OUTPUT_TRANSFORM_270)
+            self->output_transform_ = static_cast<SurfaceTransform>(transform);
+        else
+            self->output_transform_ = SurfaceTransform::Normal;
+    }
+
+    static void output_mode(void* data, wl_output*, uint32_t flags, int32_t width, int32_t height,
+                            int32_t)
+    {
+        auto* self = static_cast<Impl*>(data);
+        if ((flags & WL_OUTPUT_MODE_CURRENT) == 0)
+            return;
+        self->output_mode_width_ = width;
+        self->output_mode_height_ = height;
+    }
+
+    static void output_done(void*, wl_output*)
+    {
+    }
+
+    static void output_scale(void*, wl_output*, int32_t)
     {
     }
 
@@ -407,10 +456,40 @@ private:
         const int configured_height = static_cast<int>(height);
         if (configured_width <= 0 || configured_height <= 0)
             return;
-        if (self->width_ != configured_width || self->height_ != configured_height) {
+        const Extent configured_surface {configured_width, configured_height};
+        // Labwc exposes layer-shell configure dimensions in logical output
+        // coordinates (1232x504 below the existing 64px panel on K230), even
+        // though wl_output's native DRM mode is 568x1232 with transform=90.
+        // Do not rotate a buffer a second time in that normal case.  Keep the
+        // fallback for compositors which instead configure a narrow native
+        // edge surface directly.
+        const bool configured_in_native_axes =
+            is_quarter_turn(self->output_transform_) &&
+            ((configured_width == self->output_mode_width_ &&
+              configured_height <= self->output_mode_height_) ||
+             (configured_height == self->output_mode_height_ &&
+              configured_width <= self->output_mode_width_));
+        const SurfaceTransform buffer_transform = configured_in_native_axes
+                                                      ? inverse_transform(self->output_transform_)
+                                                      : SurfaceTransform::Normal;
+        const Extent buffer_extent =
+            buffer_extent_for_surface(configured_surface, buffer_transform);
+        if (self->surface_width_ != configured_width || self->surface_height_ != configured_height ||
+            self->width_ != buffer_extent.width || self->height_ != buffer_extent.height ||
+            self->buffer_transform_ != buffer_transform) {
             self->destroy_buffers();
-            self->width_ = configured_width;
-            self->height_ = configured_height;
+            self->surface_width_ = configured_width;
+            self->surface_height_ = configured_height;
+            self->width_ = buffer_extent.width;
+            self->height_ = buffer_extent.height;
+            self->buffer_transform_ = buffer_transform;
+            wl_surface_set_buffer_transform(
+                self->surface_, static_cast<int32_t>(self->buffer_transform_));
+            std::fprintf(stderr,
+                         "tdvp-quick-settings: layer %dx%d, output %dx%d transform %d, buffer %dx%d\n",
+                         configured_width, configured_height, self->output_mode_width_,
+                         self->output_mode_height_, static_cast<int>(self->output_transform_),
+                         self->width_, self->height_);
             if (!self->create_buffers()) {
                 std::fprintf(stderr, "tdvp-quick-settings: cannot allocate wl_shm buffers\n");
                 self->running_ = false;
@@ -429,9 +508,11 @@ private:
                               wl_fixed_t surface_y)
     {
         auto* self = static_cast<Impl*>(data);
-        self->last_pointer_x_ = wl_fixed_to_int(surface_x);
-        self->gesture_start_y_ = wl_fixed_to_int(surface_y);
-        self->last_pointer_y_ = self->gesture_start_y_;
+        const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
+                                                    wl_fixed_to_int(surface_y));
+        self->last_pointer_x_ = point.x;
+        self->gesture_start_y_ = point.y;
+        self->last_pointer_y_ = point.y;
         self->gesture_active_ = true;
     }
 
@@ -444,10 +525,12 @@ private:
                                wl_fixed_t surface_y)
     {
         auto* self = static_cast<Impl*>(data);
-        self->last_pointer_x_ = wl_fixed_to_int(surface_x);
-        self->last_pointer_y_ = wl_fixed_to_int(surface_y);
+        const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
+                                                    wl_fixed_to_int(surface_y));
+        self->last_pointer_x_ = point.x;
+        self->last_pointer_y_ = point.y;
         if (!self->open_ && self->gesture_active_ &&
-            wl_fixed_to_int(surface_y) - self->gesture_start_y_ >= kGestureOpenDistance) {
+            point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
             self->open_ = true;
             self->refresh_state();
             self->refresh_wifi_networks();
@@ -498,7 +581,7 @@ private:
             return;
         }
         const uint32_t layer = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
-        layer_surface_ = zwlr_layer_shell_v1_get_layer_surface(layer_shell_, surface_, nullptr, layer,
+        layer_surface_ = zwlr_layer_shell_v1_get_layer_surface(layer_shell_, surface_, output_, layer,
                                                                 "tdvp-quick-settings");
         zwlr_layer_surface_v1_add_listener(layer_surface_, &layer_listener(), this);
         if (open_) {
@@ -508,9 +591,10 @@ private:
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
             zwlr_layer_surface_v1_set_size(layer_surface_, 0, 0);
         } else {
-            zwlr_layer_surface_v1_set_anchor(layer_surface_, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                                                  ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                                                  ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+            zwlr_layer_surface_v1_set_anchor(
+                layer_surface_, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
             zwlr_layer_surface_v1_set_size(layer_surface_, 0, kHiddenHeight);
         }
         zwlr_layer_surface_v1_set_exclusive_zone(layer_surface_, 0);
@@ -533,6 +617,9 @@ private:
         }
         width_ = 0;
         height_ = 0;
+        surface_width_ = 0;
+        surface_height_ = 0;
+        buffer_transform_ = SurfaceTransform::Normal;
     }
 
     bool create_buffers()
@@ -600,6 +687,14 @@ private:
         }
     }
 
+    [[nodiscard]] Point map_surface_point(int surface_x, int surface_y) const
+    {
+        if (width_ <= 0 || height_ <= 0)
+            return Point {surface_x, surface_y};
+        return surface_to_buffer(Point {surface_x, surface_y}, Extent {width_, height_},
+                                 buffer_transform_);
+    }
+
     void redraw()
     {
         Buffer* buffer = nullptr;
@@ -639,9 +734,7 @@ private:
         cairo_fill(context);
         cairo_set_source_rgb(context, 0.15, 0.15, 0.13);
         draw_text(context, 24.0, 31.0, 18.0, "Quick Settings", true);
-        const std::string clock = current_time_text();
-        draw_text(context, static_cast<double>(width_ - 80), 31.0, 16.0, clock.c_str(), true);
-        draw_text(context, 24.0, 88.0, 24.0, "Quick Settings", true);
+        draw_text(context, static_cast<double>(width_ - 74), 31.0, 14.0, "Close");
 
         const QuickSettingsModel model = derive_model(snapshot_);
         const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
@@ -702,7 +795,7 @@ private:
 
         if (!message_.empty()) {
             cairo_set_source_rgb(context, 0.52, 0.18, 0.08);
-            draw_text(context, 24.0, 506.0, 13.0, message_.c_str());
+            draw_text(context, 24.0, static_cast<double>(height_ - 14), 13.0, message_.c_str());
         }
         if (pending_confirmation_ != Confirmation::None)
             draw_confirmation(context);
@@ -1038,6 +1131,7 @@ private:
     wl_compositor* compositor_ = nullptr;
     wl_shm* shm_ = nullptr;
     wl_seat* seat_ = nullptr;
+    wl_output* output_ = nullptr;
     wl_pointer* pointer_ = nullptr;
     wl_keyboard* keyboard_ = nullptr;
     zwlr_layer_shell_v1* layer_shell_ = nullptr;
@@ -1048,6 +1142,12 @@ private:
     std::size_t mapping_length_ = 0;
     int width_ = 0;
     int height_ = 0;
+    int surface_width_ = 0;
+    int surface_height_ = 0;
+    int output_mode_width_ = 0;
+    int output_mode_height_ = 0;
+    SurfaceTransform output_transform_ = SurfaceTransform::Normal;
+    SurfaceTransform buffer_transform_ = SurfaceTransform::Normal;
     int gesture_start_y_ = 0;
     int last_pointer_x_ = 0;
     int last_pointer_y_ = 0;

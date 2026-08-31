@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(tdvp_quick_settings VERSION 0.1.1 LANGUAGES C CXX)
+project(tdvp_quick_settings VERSION 0.1.2 LANGUAGES C CXX)
 
 option(TDVP_QS_BUILD_WAYLAND "Build the Wayland layer-shell executable" ON)
 option(TDVP_QS_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
@@ -16,6 +16,7 @@ endif()
 add_library(tdvp-quick-settings-core STATIC
     src/core/controller.cpp
     src/core/layout.cpp
+    src/core/orientation.cpp
     src/core/status.cpp
 )
 target_include_directories(tdvp-quick-settings-core PUBLIC src)

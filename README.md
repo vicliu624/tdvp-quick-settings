@@ -6,8 +6,11 @@ enhancement: it does not own the window manager, desktop, NetworkManager,
 PulseAudio, or board GPIO policy.
 
 The first supported profile is the 1232×568 TDVP K230 desktop. The panel opens
-from a thin top-edge gesture surface and uses `wl_shm` plus Cairo directly. It
-does not link GTK, Qt, WebKit, Electron, or an application shell.
+from a thin top-edge gesture surface and uses `wl_shm` plus Cairo directly. On
+the shipping Labwc profile, the existing 64px top panel remains visible and
+the drawer receives the remaining 1232×504 logical area; the layout is
+explicitly validated for both this profile and an unobstructed 1232×568
+output. It does not link GTK, Qt, WebKit, Electron, or an application shell.
 
 ## Design boundaries
 
@@ -51,9 +54,9 @@ drawer buffers when closed.
 
 | State | Maximum dedicated graphics allocation |
 |---|---:|
-| Edge trigger + status strip only | 0.6 MiB |
-| 1232×520 drawer, two 32-bit wl_shm buffers | 4.89 MiB |
-| Full UI target process RSS | 12 MiB |
+| Edge trigger only, two 1232×8 32-bit wl_shm buffers | 0.08 MiB |
+| 1232×504 drawer, two 32-bit wl_shm buffers | 4.74 MiB |
+| UI-owned graphics allocation while open | 4.74 MiB |
 
 See [docs/memory-budget.md](docs/memory-budget.md) and
 [docs/backend-protocol.md](docs/backend-protocol.md).

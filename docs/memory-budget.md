@@ -6,24 +6,27 @@ process has two modes.
 ## Hidden / idle
 
 * A transparent 1232×8 top-edge surface detects the first downward gesture.
-* A small right-side status surface is retained.
+* No separate status surface is retained; the existing desktop top panel stays
+  responsible for persistent status indicators.
 * There is no timer-driven animation, background screenshot, blur, image cache,
   GTK scene graph, or polling worker thread.
-* Target process PSS is at most 3 MiB and RSS at most 6 MiB.
+* The two `wl_shm` buffers consume 78,848 bytes (0.08 MiB). Process RSS/PSS
+  remains an image-level measured acceptance value rather than an unsupported
+  static claim.
 
 ## Open drawer
 
-The drawer is 1232×520 and uses two 32-bit `wl_shm` buffers:
+The shipping Labwc profile reserves 64px for its existing top panel, so the
+drawer is 1232×504 and uses two 32-bit `wl_shm` buffers:
 
 ```
-1232 × 520 × 4 × 2 = 5,125,120 bytes = 4.89 MiB
+1232 × 504 × 4 × 2 = 4,967,424 bytes = 4.74 MiB
 ```
 
 The drawer paints directly onto those buffers with Cairo. It does not allocate
-an additional offscreen render target. Target PSS is at most 9 MiB and RSS at
-most 12 MiB.
+an additional offscreen render target. The image-level acceptance test records
+RSS/PSS for the actual linked library set and rejects persistent growth.
 
 The image-level acceptance test must open and close the drawer thirty times,
 then compare `smaps_rollup` after sixty seconds. Any persistent growth is a
 failure.
-

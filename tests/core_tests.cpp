@@ -1,5 +1,6 @@
 #include "core/controller.hpp"
 #include "core/layout.hpp"
+#include "core/orientation.hpp"
 #include "core/status.hpp"
 
 #include <cstdlib>
@@ -15,7 +16,9 @@ using tdvp::quick_settings::Extent;
 using tdvp::quick_settings::GpsState;
 using tdvp::quick_settings::HardwareSnapshot;
 using tdvp::quick_settings::LteSkuState;
+using tdvp::quick_settings::Point;
 using tdvp::quick_settings::RequestedAction;
+using tdvp::quick_settings::SurfaceTransform;
 
 int failures = 0;
 
@@ -129,12 +132,42 @@ void test_target_layout_is_touch_safe_and_scroll_free()
     EXPECT(layout.network_settings.y + layout.network_settings.height == 544);
 }
 
+void test_layout_fits_below_the_existing_top_panel()
+{
+    HardwareSnapshot snapshot;
+    const auto model = tdvp::quick_settings::derive_model(snapshot);
+    const auto layout = tdvp::quick_settings::make_layout(Extent {1232, 504}, model);
+    EXPECT(layout.supported);
+    EXPECT(tdvp::quick_settings::valid_layout(layout, Extent {1232, 504}));
+    EXPECT(layout.primary_cards[0].y == 64);
+    EXPECT(layout.network_settings.y + layout.network_settings.height <= 504);
+}
+
 void test_other_logical_modes_are_not_silently_scaled()
 {
     HardwareSnapshot snapshot;
     const auto model = tdvp::quick_settings::derive_model(snapshot);
     const auto layout = tdvp::quick_settings::make_layout(Extent {1024, 600}, model);
     EXPECT(!layout.supported);
+}
+
+void test_rotated_k230_surface_uses_landscape_buffer_and_input_coordinates()
+{
+    const Extent raw_surface {568, 1232};
+    const auto buffer = tdvp::quick_settings::buffer_extent_for_surface(
+        raw_surface, SurfaceTransform::Rotate270);
+    EXPECT(buffer.width == 1232);
+    EXPECT(buffer.height == 568);
+    const auto top_left = tdvp::quick_settings::surface_to_buffer(
+        Point {0, 0}, buffer, SurfaceTransform::Rotate270);
+    EXPECT(top_left.x == 1231);
+    EXPECT(top_left.y == 0);
+    const auto bottom_right = tdvp::quick_settings::surface_to_buffer(
+        Point {567, 1231}, buffer, SurfaceTransform::Rotate270);
+    EXPECT(bottom_right.x == 0);
+    EXPECT(bottom_right.y == 567);
+    EXPECT(tdvp::quick_settings::inverse_transform(SurfaceTransform::Rotate90) ==
+           SurfaceTransform::Rotate270);
 }
 
 }  // namespace
@@ -148,7 +181,9 @@ int main()
     test_radio_transition_requires_confirmation();
     test_no_lte_keyboard_rejects_gps_control();
     test_target_layout_is_touch_safe_and_scroll_free();
+    test_layout_fits_below_the_existing_top_panel();
     test_other_logical_modes_are_not_silently_scaled();
+    test_rotated_k230_surface_uses_landscape_buffer_and_input_coordinates();
     if (failures == 0) {
         std::cout << "all tdvp-quick-settings core tests passed\n";
         return EXIT_SUCCESS;
