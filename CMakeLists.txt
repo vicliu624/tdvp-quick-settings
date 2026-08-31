@@ -28,6 +28,16 @@ if(BUILD_TESTING)
     target_compile_features(tdvp-quick-settings-core-tests PRIVATE cxx_std_17)
     target_compile_options(tdvp-quick-settings-core-tests PRIVATE ${TDVP_QS_COMMON_WARNINGS})
     add_test(NAME tdvp-quick-settings-core-tests COMMAND tdvp-quick-settings-core-tests)
+    if(UNIX)
+        add_executable(tdvp-quick-settings-wifi-tests
+            tests/wifi_tests.cpp
+            src/wayland/wifi_nmcli.cpp
+        )
+        target_include_directories(tdvp-quick-settings-wifi-tests PRIVATE src)
+        target_compile_features(tdvp-quick-settings-wifi-tests PRIVATE cxx_std_17)
+        target_compile_options(tdvp-quick-settings-wifi-tests PRIVATE ${TDVP_QS_COMMON_WARNINGS})
+        add_test(NAME tdvp-quick-settings-wifi-tests COMMAND tdvp-quick-settings-wifi-tests)
+    endif()
 endif()
 
 if(TDVP_QS_BUILD_WAYLAND AND UNIX)

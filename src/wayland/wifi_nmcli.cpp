@@ -6,6 +6,7 @@
 #include <cstring>
 #include <set>
 #include <string>
+#include <string_view>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -167,27 +168,17 @@ bool WifiNetwork::requires_password() const
     return !security.empty() && security != "--";
 }
 
-WifiScanResult scan_wifi_networks()
+WifiScanResult parse_nmcli_wifi_listing(std::string_view listing,
+                                        const std::vector<std::string>& saved_ssids)
 {
     WifiScanResult scan;
-    if (access(kNmcliPath, X_OK) != 0) {
-        scan.error = "NetworkManager command is unavailable";
-        return scan;
-    }
-    const CommandResult result = run_capture({kNmcliPath, "-t", "--escape", "yes", "-f",
-                                                "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi",
-                                                "list", "--rescan", "no"});
-    if (result.exit_status != 0) {
-        scan.error = "NetworkManager cannot list Wi-Fi networks";
-        return scan;
-    }
-    const std::set<std::string> saved = saved_wifi_networks();
+    const std::set<std::string> saved(saved_ssids.begin(), saved_ssids.end());
     std::size_t cursor = 0;
-    while (cursor < result.output.size()) {
-        const std::size_t line_end = result.output.find('\n', cursor);
-        const std::string line = result.output.substr(cursor, line_end == std::string::npos
-                                                                   ? std::string::npos
-                                                                   : line_end - cursor);
+    while (cursor < listing.size()) {
+        const std::size_t line_end = listing.find('\n', cursor);
+        const std::string line(listing.substr(cursor, line_end == std::string::npos
+                                                           ? std::string::npos
+                                                           : line_end - cursor));
         const std::vector<std::string> fields = split_terse_fields(line);
         if (fields.size() >= 4U && !fields[1].empty() && fields[1] != "--") {
             WifiNetwork network;
@@ -220,6 +211,25 @@ WifiScanResult scan_wifi_networks()
                         scan.networks.end());
     scan.ok = true;
     return scan;
+}
+
+WifiScanResult scan_wifi_networks()
+{
+    WifiScanResult scan;
+    if (access(kNmcliPath, X_OK) != 0) {
+        scan.error = "NetworkManager command is unavailable";
+        return scan;
+    }
+    const CommandResult result = run_capture({kNmcliPath, "-t", "--escape", "yes", "-f",
+                                                "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi",
+                                                "list", "--rescan", "no"});
+    if (result.exit_status != 0) {
+        scan.error = "NetworkManager cannot list Wi-Fi networks";
+        return scan;
+    }
+    const std::set<std::string> saved = saved_wifi_networks();
+    const std::vector<std::string> saved_ssids(saved.begin(), saved.end());
+    return parse_nmcli_wifi_listing(result.output, saved_ssids);
 }
 
 bool request_wifi_rescan()

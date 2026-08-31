@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tdvp::quick_settings {
@@ -20,6 +21,12 @@ struct WifiScanResult {
     std::vector<WifiNetwork> networks;
     std::string error;
 };
+
+// Pure parser for NetworkManager's `nmcli -t --escape yes` listing. Keeping it
+// separate from process execution lets the exact data contract be tested on a
+// host without a Wi-Fi adapter or a running NetworkManager instance.
+[[nodiscard]] WifiScanResult parse_nmcli_wifi_listing(
+    std::string_view listing, const std::vector<std::string>& saved_ssids);
 
 // Reads NetworkManager's already-known scan cache. It deliberately does not
 // force a radio scan while the drawer is opening, so rendering never stalls on
