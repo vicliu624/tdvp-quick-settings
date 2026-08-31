@@ -78,6 +78,7 @@ if(TDVP_QS_BUILD_WAYLAND AND UNIX)
     add_executable(tdvp-quick-settings
         src/main.cpp
         src/wayland/provider_client.cpp
+        src/wayland/wifi_nmcli.cpp
         src/wayland/wayland_app.cpp
         ${TDVP_QS_PROTOCOL_SOURCE}
         ${TDVP_QS_XDG_SHELL_SOURCE}

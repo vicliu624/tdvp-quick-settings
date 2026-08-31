@@ -5,7 +5,6 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
-#include <fstream>
 #include <sstream>
 
 #include <sys/socket.h>
@@ -16,7 +15,6 @@ namespace tdvp::quick_settings {
 namespace {
 
 constexpr char kSocketPath[] = "/run/vicliu-pocket-linux-hardware/quick-settings.sock";
-constexpr char kStatusPath[] = "/run/vicliu-pocket-linux-hardware/status.env";
 constexpr std::size_t kMaximumReplyBytes = 16384;
 
 std::string trim(std::string value)
@@ -58,21 +56,6 @@ ProviderReply parse_reply(const std::string& payload)
     return reply;
 }
 
-ProviderReply read_cached_state()
-{
-    ProviderReply reply;
-    std::ifstream status(kStatusPath);
-    if (!status) {
-        reply.error = "hardware provider is unavailable";
-        return reply;
-    }
-    std::ostringstream contents;
-    contents << status.rdbuf();
-    reply.ok = true;
-    reply.snapshot = parse_status_environment(contents.str());
-    return reply;
-}
-
 }  // namespace
 
 ProviderReply ProviderClient::state() const
@@ -90,7 +73,7 @@ ProviderReply ProviderClient::request(const std::string& command) const
 
     const int descriptor = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (descriptor < 0)
-        return command == "GET_STATE" ? read_cached_state() : ProviderReply {false, {}, "cannot open hardware provider socket"};
+        return ProviderReply {false, {}, "cannot open hardware provider socket"};
 
     sockaddr_un address {};
     address.sun_family = AF_UNIX;
@@ -101,7 +84,7 @@ ProviderReply ProviderClient::request(const std::string& command) const
     std::strcpy(address.sun_path, kSocketPath);
     if (connect(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
         close(descriptor);
-        return command == "GET_STATE" ? read_cached_state() : ProviderReply {false, {}, "hardware provider is unavailable"};
+        return ProviderReply {false, {}, "hardware provider is unavailable"};
     }
 
     const std::string packet = command + "\n";

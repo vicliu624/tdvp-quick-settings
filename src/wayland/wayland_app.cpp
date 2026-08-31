@@ -4,6 +4,7 @@
 #include "core/layout.hpp"
 #include "core/state.hpp"
 #include "wayland/provider_client.hpp"
+#include "wayland/wifi_nmcli.hpp"
 
 #include <cairo/cairo.h>
 #include <wayland-client.h>
@@ -21,7 +22,6 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <csignal>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +33,7 @@ extern "C" {
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -158,17 +159,26 @@ std::string current_time_text()
     return text;
 }
 
-void launch_session_process(const std::vector<const char*>& arguments)
+void launch_session_process(const std::vector<std::string>& arguments)
 {
     if (arguments.empty())
         return;
     const pid_t child = fork();
-    if (child != 0)
+    if (child < 0)
         return;
+    if (child != 0) {
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        return;
+    }
+    const pid_t grandchild = fork();
+    if (grandchild != 0)
+        _exit(grandchild < 0 ? 127 : 0);
     std::vector<char*> argv;
     argv.reserve(arguments.size() + 1U);
-    for (const char* argument : arguments)
-        argv.push_back(const_cast<char*>(argument));
+    for (const std::string& argument : arguments)
+        argv.push_back(const_cast<char*>(argument.c_str()));
     argv.push_back(nullptr);
     execv(argv[0], argv.data());
     _exit(127);
@@ -181,6 +191,8 @@ public:
     ~Impl()
     {
         destroy_surface();
+        if (keyboard_ != nullptr)
+            wl_keyboard_destroy(keyboard_);
         if (pointer_ != nullptr)
             wl_pointer_destroy(pointer_);
         if (seat_ != nullptr)
@@ -199,7 +211,6 @@ public:
 
     int run(bool open_on_start)
     {
-        std::signal(SIGCHLD, SIG_IGN);
         display_ = wl_display_connect(nullptr);
         if (display_ == nullptr) {
             std::fprintf(stderr, "tdvp-quick-settings: cannot connect to Wayland display\n");
@@ -213,8 +224,10 @@ public:
             return 69;
         }
         open_ = open_on_start;
-        if (open_)
+        if (open_) {
             refresh_state();
+            refresh_wifi_networks();
+        }
         create_surface();
         while (running_ && wl_display_dispatch(display_) != -1) {
         }
@@ -250,6 +263,18 @@ private:
         listener.axis_source = pointer_axis_source;
         listener.axis_stop = pointer_axis_stop;
         listener.axis_discrete = pointer_axis_discrete;
+        return listener;
+    }
+
+    static const wl_keyboard_listener& keyboard_listener()
+    {
+        static wl_keyboard_listener listener {};
+        listener.keymap = keyboard_keymap;
+        listener.enter = keyboard_enter;
+        listener.leave = keyboard_leave;
+        listener.key = keyboard_key;
+        listener.modifiers = keyboard_modifiers;
+        listener.repeat_info = keyboard_repeat_info;
         return listener;
     }
 
@@ -305,9 +330,71 @@ private:
             wl_pointer_destroy(self->pointer_);
             self->pointer_ = nullptr;
         }
+        const bool has_keyboard = (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
+        if (has_keyboard && self->keyboard_ == nullptr) {
+            self->keyboard_ = wl_seat_get_keyboard(seat);
+            wl_keyboard_add_listener(self->keyboard_, &keyboard_listener(), self);
+        } else if (!has_keyboard && self->keyboard_ != nullptr) {
+            wl_keyboard_destroy(self->keyboard_);
+            self->keyboard_ = nullptr;
+        }
     }
 
     static void seat_name(void*, wl_seat*, const char*)
+    {
+    }
+
+    static void keyboard_keymap(void*, wl_keyboard*, uint32_t, int fd, uint32_t)
+    {
+        if (fd >= 0)
+            close(fd);
+    }
+
+    static void keyboard_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*)
+    {
+    }
+
+    static void keyboard_leave(void*, wl_keyboard*, uint32_t, wl_surface*)
+    {
+    }
+
+    static void keyboard_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key,
+                             uint32_t state)
+    {
+        auto* self = static_cast<Impl*>(data);
+        if (key == KEY_LEFTSHIFT)
+            self->left_shift_ = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+        else if (key == KEY_RIGHTSHIFT)
+            self->right_shift_ = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+        if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !self->wifi_password_active())
+            return;
+        if (key == KEY_ESC) {
+            self->cancel_wifi_password();
+            return;
+        }
+        if (key == KEY_BACKSPACE) {
+            if (!self->wifi_passphrase_.empty())
+                self->wifi_passphrase_.pop_back();
+            self->redraw();
+            return;
+        }
+        if (key == KEY_ENTER || key == KEY_KPENTER) {
+            self->submit_wifi_password();
+            return;
+        }
+        const char character = self->password_character(key);
+        if (character != '\0' && self->wifi_passphrase_.size() < 63U) {
+            self->wifi_passphrase_ += character;
+            self->redraw();
+        }
+    }
+
+    static void keyboard_modifiers(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                   uint32_t)
+    {
+    }
+
+    static void keyboard_repeat_info(void*, wl_keyboard*, int32_t, int32_t)
     {
     }
 
@@ -363,6 +450,7 @@ private:
             wl_fixed_to_int(surface_y) - self->gesture_start_y_ >= kGestureOpenDistance) {
             self->open_ = true;
             self->refresh_state();
+            self->refresh_wifi_networks();
             self->create_surface();
         }
     }
@@ -427,7 +515,8 @@ private:
         }
         zwlr_layer_surface_v1_set_exclusive_zone(layer_surface_, 0);
         zwlr_layer_surface_v1_set_keyboard_interactivity(
-            layer_surface_, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+            layer_surface_, wifi_password_active() ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE
+                                                   : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
         wl_surface_commit(surface_);
     }
 
@@ -589,10 +678,27 @@ private:
         cairo_set_source_rgb(context, 0.15, 0.15, 0.13);
         draw_text(context, 928.0, 88.0, 22.0, "Networks", true);
         draw_card(context, layout.network_toggle, snapshot_.wifi_enabled ? "Wi-Fi On" : "Wi-Fi Off", "");
-        const char* names[] = {"Saved networks", "Select in advanced settings", "NetworkManager", "Wi-Fi radio control"};
-        for (std::size_t index = 0; index < layout.network_rows.size(); ++index)
-            draw_card(context, layout.network_rows[index], names[index], "");
-        draw_card(context, layout.network_settings, "Network settings", "Advanced options");
+        for (std::size_t index = 0; index < layout.network_rows.size(); ++index) {
+            if (index >= wifi_scan_.networks.size()) {
+                if (index == 0U) {
+                    const char* detail = !snapshot_.wifi_enabled ? "Turn Wi-Fi on to scan" :
+                                         (wifi_scan_.error.empty() ? "No networks in cache" : wifi_scan_.error.c_str());
+                    draw_card(context, layout.network_rows[index], "No Wi-Fi networks", detail);
+                }
+                continue;
+            }
+            const WifiNetwork& network = wifi_scan_.networks[index];
+            std::string detail;
+            if (network.active)
+                detail = "Connected";
+            else if (network.requires_password())
+                detail = network.saved ? "Saved secure network" : "Secure network";
+            else
+                detail = "Open network";
+            detail += "  " + std::to_string(network.signal_percent) + "%";
+            draw_card(context, layout.network_rows[index], network.ssid.c_str(), detail.c_str());
+        }
+        draw_card(context, layout.network_settings, "Refresh networks", "Use NetworkManager scan");
 
         if (!message_.empty()) {
             cairo_set_source_rgb(context, 0.52, 0.18, 0.08);
@@ -600,6 +706,8 @@ private:
         }
         if (pending_confirmation_ != Confirmation::None)
             draw_confirmation(context);
+        else if (wifi_password_active())
+            draw_wifi_password(context);
     }
 
     void draw_confirmation(cairo_t* context)
@@ -620,6 +728,35 @@ private:
         draw_card(context, confirm, "Switch", "");
     }
 
+    void draw_wifi_password(cairo_t* context)
+    {
+        if (selected_network_index_ < 0 ||
+            static_cast<std::size_t>(selected_network_index_) >= wifi_scan_.networks.size())
+            return;
+        const WifiNetwork& network = wifi_scan_.networks[static_cast<std::size_t>(selected_network_index_)];
+        const Rect dialog {312, 150, 608, 262};
+        draw_rounded_rect(context, dialog, 12.0);
+        cairo_set_source_rgba(context, 0.12, 0.12, 0.10, 0.97);
+        cairo_fill(context);
+        cairo_set_source_rgb(context, 1.0, 0.98, 0.94);
+        draw_text(context, 344.0, 198.0, 22.0, "Connect to Wi-Fi", true);
+        draw_text(context, 344.0, 230.0, 16.0, network.ssid.c_str());
+        draw_text(context, 344.0, 258.0, 14.0, "Enter the network password with the physical keyboard.");
+        const Rect password_field {344, 278, 544, 48};
+        draw_rounded_rect(context, password_field, 7.0);
+        cairo_set_source_rgb(context, 0.96, 0.95, 0.91);
+        cairo_fill_preserve(context);
+        cairo_set_source_rgb(context, 0.64, 0.60, 0.53);
+        cairo_stroke(context);
+        const std::string masked(wifi_passphrase_.size(), '*');
+        cairo_set_source_rgb(context, 0.16, 0.16, 0.14);
+        draw_text(context, 360.0, 309.0, 18.0, masked.empty() ? "Password" : masked.c_str());
+        const Rect cancel {344, 346, 256, 48};
+        const Rect connect {632, 346, 256, 48};
+        draw_card(context, cancel, "Cancel", "Esc");
+        draw_card(context, connect, "Connect", "Enter");
+    }
+
     void refresh_state()
     {
         const ProviderReply reply = provider_.state();
@@ -628,6 +765,81 @@ private:
             message_.clear();
         } else {
             message_ = reply.error;
+        }
+    }
+
+    void refresh_wifi_networks()
+    {
+        wifi_scan_ = {};
+        if (!snapshot_.wifi_enabled)
+            return;
+        wifi_scan_ = scan_wifi_networks();
+        if (wifi_scan_.ok)
+            (void)request_wifi_rescan();
+    }
+
+    [[nodiscard]] bool wifi_password_active() const
+    {
+        return selected_network_index_ >= 0;
+    }
+
+    void cancel_wifi_password()
+    {
+        selected_network_index_ = -1;
+        wifi_passphrase_.clear();
+        message_ = "Wi-Fi connection cancelled";
+        create_surface();
+    }
+
+    void submit_wifi_password()
+    {
+        if (selected_network_index_ < 0 ||
+            static_cast<std::size_t>(selected_network_index_) >= wifi_scan_.networks.size()) {
+            cancel_wifi_password();
+            return;
+        }
+        if (wifi_passphrase_.empty()) {
+            message_ = "Enter the Wi-Fi password first";
+            redraw();
+            return;
+        }
+        const WifiNetwork& network = wifi_scan_.networks[static_cast<std::size_t>(selected_network_index_)];
+        const bool started = request_wifi_connect(network, wifi_passphrase_);
+        const std::string ssid = network.ssid;
+        selected_network_index_ = -1;
+        std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
+        wifi_passphrase_.clear();
+        message_ = started ? "Connecting to " + ssid : "Could not start Wi-Fi connection";
+        create_surface();
+    }
+
+    [[nodiscard]] char password_character(uint32_t key) const
+    {
+        const bool shifted = left_shift_ || right_shift_;
+        if (key >= KEY_A && key <= KEY_Z) {
+            const char base = static_cast<char>('a' + (key - KEY_A));
+            return shifted ? static_cast<char>(base - 'a' + 'A') : base;
+        }
+        if (key >= KEY_1 && key <= KEY_9) {
+            static constexpr char kShiftedDigits[] = "!@#$%^&*(";
+            return shifted ? kShiftedDigits[key - KEY_1] : static_cast<char>('1' + (key - KEY_1));
+        }
+        if (key == KEY_0)
+            return shifted ? ')' : '0';
+        switch (key) {
+        case KEY_SPACE: return ' ';
+        case KEY_MINUS: return shifted ? '_' : '-';
+        case KEY_EQUAL: return shifted ? '+' : '=';
+        case KEY_LEFTBRACE: return shifted ? '{' : '[';
+        case KEY_RIGHTBRACE: return shifted ? '}' : ']';
+        case KEY_BACKSLASH: return shifted ? '|' : '\\';
+        case KEY_SEMICOLON: return shifted ? ':' : ';';
+        case KEY_APOSTROPHE: return shifted ? '\"' : '\'';
+        case KEY_GRAVE: return shifted ? '~' : '`';
+        case KEY_COMMA: return shifted ? '<' : ',';
+        case KEY_DOT: return shifted ? '>' : '.';
+        case KEY_SLASH: return shifted ? '?' : '/';
+        default: return '\0';
         }
     }
 
@@ -693,6 +905,9 @@ private:
         if (pointer_y < kStatusHeight) {
             open_ = false;
             pending_confirmation_ = Confirmation::None;
+            selected_network_index_ = -1;
+            std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
+            wifi_passphrase_.clear();
             create_surface();
             return;
         }
@@ -707,13 +922,24 @@ private:
             }
             return;
         }
+        if (wifi_password_active()) {
+            const Rect cancel {344, 346, 256, 48};
+            const Rect connect {632, 346, 256, 48};
+            if (cancel.contains(pointer_x, pointer_y))
+                cancel_wifi_password();
+            else if (connect.contains(pointer_x, pointer_y))
+                submit_wifi_password();
+            return;
+        }
         const QuickSettingsModel model = derive_model(snapshot_);
         const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
         if (!layout.supported)
             return;
         if (layout.primary_cards[0].contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/nmcli", "nmcli", "radio", "wifi", snapshot_.wifi_enabled ? "off" : "on"});
-            message_ = snapshot_.wifi_enabled ? "Wi-Fi disabled" : "Wi-Fi enabled";
+            if (request_wifi_radio(!snapshot_.wifi_enabled))
+                message_ = snapshot_.wifi_enabled ? "Turning Wi-Fi off" : "Turning Wi-Fi on";
+            else
+                message_ = "Could not start NetworkManager Wi-Fi request";
         } else if (layout.primary_cards[1].contains(pointer_x, pointer_y)) {
             execute_provider(snapshot_.audio_output == "external" ? "SET speaker-route internal" : "SET speaker-route external");
             return;
@@ -725,11 +951,11 @@ private:
                 execute_radio_action(snapshot_.gps_enabled ? RequestedAction::DisableGps : RequestedAction::EnableGps, false);
                 return;
             }
-            launch_session_process({"/usr/local/bin/vpl-osk", "vpl-osk"});
+            launch_session_process({"/usr/local/bin/vpl-osk"});
             message_ = "On-screen keyboard toggled";
         } else if (layout.sliders[0].contains(pointer_x, pointer_y)) {
             const int percent = slider_percent(layout.sliders[0], pointer_x);
-            launch_session_process({"/usr/bin/pactl", "pactl", "set-sink-volume", "@DEFAULT_SINK@", (std::to_string(percent) + "%").c_str()});
+            launch_session_process({"/usr/bin/pactl", "set-sink-volume", "@DEFAULT_SINK@", std::to_string(percent) + "%"});
             snapshot_.volume_percent = percent;
         } else if (layout.sliders[1].contains(pointer_x, pointer_y)) {
             execute_provider("SET display-brightness " + std::to_string(slider_percent(layout.sliders[1], pointer_x)));
@@ -738,10 +964,10 @@ private:
             execute_provider("SET keyboard-backlight " + std::to_string(slider_percent(layout.sliders[2], pointer_x)));
             return;
         } else if (layout.secondary_actions[0].contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/pactl", "pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"});
+            launch_session_process({"/usr/bin/pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"});
             snapshot_.muted = !snapshot_.muted;
         } else if (layout.secondary_actions[1].contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/nm-connection-editor", "nm-connection-editor"});
+            launch_session_process({"/usr/bin/pcmanfm", "--desktop-pref"});
         } else if (layout.system_actions[0].contains(pointer_x, pointer_y)) {
             execute_provider("SYSTEM lock");
             return;
@@ -752,9 +978,51 @@ private:
             execute_provider("SYSTEM poweroff");
             return;
         } else if (layout.network_toggle.contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/nmcli", "nmcli", "radio", "wifi", snapshot_.wifi_enabled ? "off" : "on"});
-        } else if (layout.network_settings.contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/nm-connection-editor", "nm-connection-editor"});
+            if (request_wifi_radio(!snapshot_.wifi_enabled))
+                message_ = snapshot_.wifi_enabled ? "Turning Wi-Fi off" : "Turning Wi-Fi on";
+            else
+                message_ = "Could not start NetworkManager Wi-Fi request";
+        } else {
+            bool network_selected = false;
+            for (std::size_t index = 0; index < layout.network_rows.size(); ++index) {
+                if (!layout.network_rows[index].contains(pointer_x, pointer_y))
+                    continue;
+                network_selected = true;
+                if (index >= wifi_scan_.networks.size()) {
+                    message_ = snapshot_.wifi_enabled ? "No network is available here" : "Turn Wi-Fi on first";
+                    break;
+                }
+                const WifiNetwork& network = wifi_scan_.networks[index];
+                if (network.active) {
+                    message_ = "Already connected to " + network.ssid;
+                } else if (network.requires_password() && !network.saved) {
+                    selected_network_index_ = static_cast<int>(index);
+                    std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
+                    wifi_passphrase_.clear();
+                    message_.clear();
+                    create_surface();
+                    return;
+                } else if (request_wifi_connect(network)) {
+                    message_ = "Connecting to " + network.ssid;
+                } else {
+                    message_ = "Could not start Wi-Fi connection";
+                }
+                break;
+            }
+            if (network_selected) {
+                redraw();
+                return;
+            }
+            if (layout.network_settings.contains(pointer_x, pointer_y)) {
+                if (!snapshot_.wifi_enabled) {
+                    message_ = "Turn Wi-Fi on before scanning";
+                } else if (request_wifi_rescan()) {
+                    refresh_wifi_networks();
+                    message_ = "NetworkManager scan requested";
+                } else {
+                    message_ = "Could not request a Wi-Fi scan";
+                }
+            }
         }
         redraw();
     }
@@ -765,6 +1033,7 @@ private:
     wl_shm* shm_ = nullptr;
     wl_seat* seat_ = nullptr;
     wl_pointer* pointer_ = nullptr;
+    wl_keyboard* keyboard_ = nullptr;
     zwlr_layer_shell_v1* layer_shell_ = nullptr;
     wl_surface* surface_ = nullptr;
     zwlr_layer_surface_v1* layer_surface_ = nullptr;
@@ -777,11 +1046,16 @@ private:
     int last_pointer_x_ = 0;
     int last_pointer_y_ = 0;
     bool gesture_active_ = false;
+    bool left_shift_ = false;
+    bool right_shift_ = false;
     bool open_ = false;
     bool running_ = true;
     ProviderClient provider_;
     HardwareSnapshot snapshot_;
+    WifiScanResult wifi_scan_;
     std::string message_;
+    int selected_network_index_ = -1;
+    std::string wifi_passphrase_;
     RequestedAction pending_action_ = RequestedAction::EnableLora;
     Confirmation pending_confirmation_ = Confirmation::None;
 };
