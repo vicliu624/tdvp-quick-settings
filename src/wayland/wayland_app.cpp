@@ -955,8 +955,8 @@ private:
             message_ = "On-screen keyboard toggled";
         } else if (layout.sliders[0].contains(pointer_x, pointer_y)) {
             const int percent = slider_percent(layout.sliders[0], pointer_x);
-            launch_session_process({"/usr/bin/pactl", "set-sink-volume", "@DEFAULT_SINK@", std::to_string(percent) + "%"});
-            snapshot_.volume_percent = percent;
+            execute_provider("SET speaker-volume " + std::to_string(percent));
+            return;
         } else if (layout.sliders[1].contains(pointer_x, pointer_y)) {
             execute_provider("SET display-brightness " + std::to_string(slider_percent(layout.sliders[1], pointer_x)));
             return;
@@ -964,13 +964,19 @@ private:
             execute_provider("SET keyboard-backlight " + std::to_string(slider_percent(layout.sliders[2], pointer_x)));
             return;
         } else if (layout.secondary_actions[0].contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"});
-            snapshot_.muted = !snapshot_.muted;
+            execute_provider("SET speaker-mute toggle");
+            return;
         } else if (layout.secondary_actions[1].contains(pointer_x, pointer_y)) {
             launch_session_process({"/usr/bin/pcmanfm", "--desktop-pref"});
         } else if (layout.system_actions[0].contains(pointer_x, pointer_y)) {
-            execute_provider("SYSTEM lock");
-            return;
+            if (access("/usr/bin/swaylock", X_OK) == 0) {
+                launch_session_process({"/usr/bin/swaylock", "-f", "-c", "1f1e1b"});
+                open_ = false;
+                pending_confirmation_ = Confirmation::None;
+                create_surface();
+                return;
+            }
+            message_ = "Authenticated screen locking is not installed";
         } else if (layout.system_actions[1].contains(pointer_x, pointer_y)) {
             execute_provider("SYSTEM reboot");
             return;
