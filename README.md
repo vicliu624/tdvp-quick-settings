@@ -13,8 +13,8 @@ receives input ahead of it, so panel widgets cannot appear through or receive
 clicks beneath the control center. It uses `wl_shm` plus Cairo directly and
 does not link GTK, Qt, WebKit, Electron, or an application shell.
 
-Opening and closing use a 180ms ease-out slide driven by Wayland frame
-callbacks. The animation translates the existing drawer content inside the
+Opening uses a 180ms ease-out slide; closing uses a 220ms symmetric ease-in-out
+slide. Both are driven by Wayland frame callbacks and translate the existing drawer content inside the
 same `wl_shm` buffers. To keep the K230 compositor smooth, the complete drawer
 is rasterized once into a temporary 2.67 MiB Cairo image and each animation
 frame only copies that image at a different vertical offset. The temporary

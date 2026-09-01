@@ -61,7 +61,8 @@ constexpr int kGestureCloseDistance = 24;
 constexpr int kBottomDismissZoneHeight = 112;
 constexpr auto kSliderUpdateInterval = std::chrono::milliseconds(45);
 constexpr int kStatusHeight = 48;
-constexpr int kDrawerAnimationDurationMs = 180;
+constexpr int kDrawerOpenAnimationDurationMs = 180;
+constexpr int kDrawerCloseAnimationDurationMs = 220;
 constexpr uint32_t kVersionCompositor = 4;
 constexpr uint32_t kVersionSeat = 5;
 constexpr uint32_t kVersionLayerShell = 4;
@@ -939,21 +940,29 @@ private:
     {
         if (!animation_active())
             return 1.0;
+        const int duration_ms = closing_animation_active_ ? kDrawerCloseAnimationDurationMs
+                                                            : kDrawerOpenAnimationDurationMs;
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - animation_started_);
         return std::max(0.0, std::min(1.0,
                                      static_cast<double>(elapsed.count()) /
-                                         static_cast<double>(kDrawerAnimationDurationMs)));
+                                         static_cast<double>(duration_ms)));
     }
 
     [[nodiscard]] double visible_drawer_fraction() const
     {
         const double progress = animation_progress();
-        const double eased = 1.0 - std::pow(1.0 - progress, 3.0);
-        if (closing_animation_active_)
+        if (closing_animation_active_) {
+            // Reversing the opening ease-out makes 70% of the drawer vanish
+            // in the first third of the transition. A symmetric ease-in-out
+            // keeps the opening frame visible and then glides it upward.
+            const double eased = progress < 0.5
+                                     ? 4.0 * progress * progress * progress
+                                     : 1.0 - std::pow(-2.0 * progress + 2.0, 3.0) / 2.0;
             return 1.0 - eased;
+        }
         if (opening_animation_active_)
-            return eased;
+            return 1.0 - std::pow(1.0 - progress, 3.0);
         return 1.0;
     }
 

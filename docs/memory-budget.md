@@ -11,8 +11,8 @@ process has two modes.
   top panel owns its normal status indicators; when the drawer opens, the
   full-screen Quick Settings overlay paints over it and receives all input.
 * There is no idle timer, background screenshot, blur, image cache, GTK scene
-  graph, or polling worker thread. The 180ms open/close transition exists only
-  while a drawer is moving and is driven by one Wayland frame callback at a
+  graph, or polling worker thread. The 180ms opening / 220ms closing transition
+  exists only while a drawer is moving and is driven by one Wayland frame callback at a
   time.
 * A slider interaction may create one short-lived helper process with a small
   Unix socketpair. It is not created while the edge trigger is idle, owns no
@@ -34,7 +34,7 @@ drawer is a 1232×568 full-screen overlay with two 32-bit `wl_shm` buffers:
 
 The drawer paints directly onto those buffers with Cairo. It does not allocate
 an additional persistent offscreen render target. During the 180ms opening or
-closing transition only, one 1232×568 ARGB32 Cairo image (2,799,104 bytes,
+220ms closing transition only, one 1232×568 ARGB32 Cairo image (2,799,104 bytes,
 2.67 MiB) caches the fully rasterized drawer. This avoids redrawing text and
 rounded paths on every frame; it is destroyed immediately when the transition
 ends. The image-level acceptance test records RSS/PSS for the actual linked
