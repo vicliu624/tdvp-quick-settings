@@ -9,8 +9,10 @@ process has two modes.
   status panel's reserved work area, detects the first downward gesture.
 * No separate status surface is retained; the existing desktop top panel stays
   responsible for persistent status indicators.
-* There is no timer-driven animation, background screenshot, blur, image cache,
-  GTK scene graph, or polling worker thread.
+* There is no idle timer, background screenshot, blur, image cache, GTK scene
+  graph, or polling worker thread. The 180ms open/close transition exists only
+  while a drawer is moving and is driven by one Wayland frame callback at a
+  time.
 * The two `wl_shm` buffers consume 78,848 bytes (0.08 MiB). Process RSS/PSS
   remains an image-level measured acceptance value rather than an unsupported
   static claim.

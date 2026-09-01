@@ -13,6 +13,11 @@ the drawer receives the remaining 1232×504 logical area; the layout is
 explicitly validated for both this profile and an unobstructed 1232×568
 output. It does not link GTK, Qt, WebKit, Electron, or an application shell.
 
+Opening and closing use a 180ms ease-out slide driven by Wayland frame
+callbacks. The animation translates the existing drawer content inside the
+same `wl_shm` buffers; it has no idle timer, blur pass, screenshot cache, or
+additional render target.
+
 ## Design boundaries
 
 * **UI repository:** gesture handling, layer-shell surface, drawing, layout,

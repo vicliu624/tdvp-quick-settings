@@ -22,13 +22,13 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <linux/input-event-codes.h>
 #include <string>
 #include <sys/mman.h>
@@ -47,6 +47,7 @@ constexpr int kHiddenHeight = 8;
 // downward drag opens the full overlay before the pointer can leave it.
 constexpr int kGestureOpenDistance = 4;
 constexpr int kStatusHeight = 48;
+constexpr int kDrawerAnimationDurationMs = 180;
 constexpr uint32_t kVersionCompositor = 4;
 constexpr uint32_t kVersionSeat = 5;
 constexpr uint32_t kVersionLayerShell = 4;
@@ -198,6 +199,8 @@ public:
         destroy_surface();
         if (output_ != nullptr)
             wl_output_destroy(output_);
+        if (touch_ != nullptr)
+            wl_touch_destroy(touch_);
         if (keyboard_ != nullptr)
             wl_keyboard_destroy(keyboard_);
         if (pointer_ != nullptr)
@@ -232,6 +235,7 @@ public:
         }
         open_ = open_on_start;
         if (open_) {
+            opening_animation_pending_ = true;
             refresh_state();
             refresh_wifi_networks();
         }
@@ -283,6 +287,19 @@ private:
         return listener;
     }
 
+    static const wl_touch_listener& touch_listener()
+    {
+        static wl_touch_listener listener {};
+        listener.down = touch_down;
+        listener.up = touch_up;
+        listener.motion = touch_motion;
+        listener.frame = touch_frame;
+        listener.cancel = touch_cancel;
+        listener.shape = touch_shape;
+        listener.orientation = touch_orientation;
+        return listener;
+    }
+
     static const wl_keyboard_listener& keyboard_listener()
     {
         static wl_keyboard_listener listener {};
@@ -299,6 +316,13 @@ private:
     {
         static wl_buffer_listener listener {};
         listener.release = buffer_release;
+        return listener;
+    }
+
+    static const wl_callback_listener& frame_listener()
+    {
+        static wl_callback_listener listener {};
+        listener.done = frame_done;
         return listener;
     }
 
@@ -386,6 +410,15 @@ private:
         } else if (!has_keyboard && self->keyboard_ != nullptr) {
             wl_keyboard_destroy(self->keyboard_);
             self->keyboard_ = nullptr;
+        }
+        const bool has_touch = (capabilities & WL_SEAT_CAPABILITY_TOUCH) != 0;
+        if (has_touch && self->touch_ == nullptr) {
+            self->touch_ = wl_seat_get_touch(seat);
+            wl_touch_add_listener(self->touch_, &touch_listener(), self);
+        } else if (!has_touch && self->touch_ != nullptr) {
+            wl_touch_destroy(self->touch_);
+            self->touch_ = nullptr;
+            self->active_touch_id_ = -1;
         }
     }
 
@@ -496,6 +529,12 @@ private:
                 return;
             }
         }
+        if (self->open_ && self->opening_animation_pending_ &&
+            configured_height > kHiddenHeight) {
+            self->opening_animation_pending_ = false;
+            self->opening_animation_active_ = true;
+            self->animation_started_ = std::chrono::steady_clock::now();
+        }
         self->redraw();
     }
 
@@ -532,6 +571,7 @@ private:
         if (!self->open_ && self->gesture_active_ &&
             point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
             self->open_ = true;
+            self->opening_animation_pending_ = true;
             self->refresh_state();
             self->refresh_wifi_networks();
             self->create_surface();
@@ -564,6 +604,77 @@ private:
     }
 
     static void pointer_axis_discrete(void*, wl_pointer*, uint32_t, int32_t)
+    {
+    }
+
+    static void touch_down(void* data, wl_touch*, uint32_t, uint32_t, wl_surface*, int32_t id,
+                           wl_fixed_t surface_x, wl_fixed_t surface_y)
+    {
+        auto* self = static_cast<Impl*>(data);
+        // One-finger gestures drive the control center.  Additional contacts
+        // are deliberately ignored so a second finger cannot click a control
+        // while the first finger is opening or dragging the drawer.
+        if (self->active_touch_id_ >= 0)
+            return;
+        const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
+                                                    wl_fixed_to_int(surface_y));
+        self->active_touch_id_ = id;
+        self->last_pointer_x_ = point.x;
+        self->last_pointer_y_ = point.y;
+        self->gesture_start_y_ = point.y;
+        self->gesture_active_ = true;
+    }
+
+    static void touch_up(void* data, wl_touch*, uint32_t, uint32_t, int32_t id)
+    {
+        auto* self = static_cast<Impl*>(data);
+        if (id != self->active_touch_id_)
+            return;
+        const bool opened_by_drag = self->opened_by_touch_drag_;
+        self->active_touch_id_ = -1;
+        self->gesture_active_ = false;
+        self->opened_by_touch_drag_ = false;
+        if (self->open_ && !opened_by_drag)
+            self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
+    }
+
+    static void touch_motion(void* data, wl_touch*, uint32_t, int32_t id, wl_fixed_t surface_x,
+                             wl_fixed_t surface_y)
+    {
+        auto* self = static_cast<Impl*>(data);
+        if (id != self->active_touch_id_)
+            return;
+        const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
+                                                    wl_fixed_to_int(surface_y));
+        self->last_pointer_x_ = point.x;
+        self->last_pointer_y_ = point.y;
+        if (!self->open_ && point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
+            self->opened_by_touch_drag_ = true;
+            self->open_ = true;
+            self->opening_animation_pending_ = true;
+            self->refresh_state();
+            self->refresh_wifi_networks();
+            self->create_surface();
+        }
+    }
+
+    static void touch_frame(void*, wl_touch*)
+    {
+    }
+
+    static void touch_cancel(void* data, wl_touch*)
+    {
+        auto* self = static_cast<Impl*>(data);
+        self->active_touch_id_ = -1;
+        self->gesture_active_ = false;
+        self->opened_by_touch_drag_ = false;
+    }
+
+    static void touch_shape(void*, wl_touch*, int32_t, wl_fixed_t, wl_fixed_t)
+    {
+    }
+
+    static void touch_orientation(void*, wl_touch*, int32_t, wl_fixed_t)
     {
     }
 
@@ -612,6 +723,10 @@ private:
 
     void destroy_surface()
     {
+        if (frame_callback_ != nullptr) {
+            wl_callback_destroy(frame_callback_);
+            frame_callback_ = nullptr;
+        }
         destroy_buffers();
         if (layer_surface_ != nullptr) {
             zwlr_layer_surface_v1_destroy(layer_surface_);
@@ -698,7 +813,64 @@ private:
         if (width_ <= 0 || height_ <= 0)
             return Point {surface_x, surface_y};
         return surface_to_buffer(Point {surface_x, surface_y}, Extent {width_, height_},
-                                 buffer_transform_);
+                                  buffer_transform_);
+    }
+
+    [[nodiscard]] bool animation_active() const
+    {
+        return opening_animation_active_ || closing_animation_active_;
+    }
+
+    [[nodiscard]] double animation_progress() const
+    {
+        if (!animation_active())
+            return 1.0;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - animation_started_);
+        return std::max(0.0, std::min(1.0,
+                                     static_cast<double>(elapsed.count()) /
+                                         static_cast<double>(kDrawerAnimationDurationMs)));
+    }
+
+    [[nodiscard]] double visible_drawer_fraction() const
+    {
+        const double progress = animation_progress();
+        const double eased = 1.0 - std::pow(1.0 - progress, 3.0);
+        if (closing_animation_active_)
+            return 1.0 - eased;
+        if (opening_animation_active_)
+            return eased;
+        return 1.0;
+    }
+
+    void begin_close_animation()
+    {
+        if (!open_ || closing_animation_active_)
+            return;
+        opening_animation_pending_ = false;
+        opening_animation_active_ = false;
+        closing_animation_active_ = true;
+        animation_started_ = std::chrono::steady_clock::now();
+        redraw();
+    }
+
+    static void frame_done(void* data, wl_callback* callback, uint32_t)
+    {
+        auto* self = static_cast<Impl*>(data);
+        wl_callback_destroy(callback);
+        self->frame_callback_ = nullptr;
+        if (!self->animation_active())
+            return;
+        if (self->animation_progress() >= 1.0) {
+            if (self->closing_animation_active_) {
+                self->closing_animation_active_ = false;
+                self->open_ = false;
+                self->create_surface();
+                return;
+            }
+            self->opening_animation_active_ = false;
+        }
+        self->redraw();
     }
 
     void redraw()
@@ -725,6 +897,10 @@ private:
         }
         cairo_destroy(context);
         cairo_surface_flush(buffer->cairo);
+        if (animation_active() && frame_callback_ == nullptr) {
+            frame_callback_ = wl_surface_frame(surface_);
+            wl_callback_add_listener(frame_callback_, &frame_listener(), this);
+        }
         wl_surface_attach(surface_, buffer->wl, 0, 0);
         wl_surface_damage_buffer(surface_, 0, 0, width_, height_);
         wl_surface_commit(surface_);
@@ -733,8 +909,24 @@ private:
 
     void draw_open(cairo_t* context)
     {
-        cairo_set_source_rgb(context, 0.965, 0.945, 0.90);
+        cairo_save(context);
+        cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(context, 0.0, 0.0, 0.0, 0.0);
         cairo_paint(context);
+        cairo_restore(context);
+
+        const double offset = (visible_drawer_fraction() - 1.0) * static_cast<double>(height_);
+        cairo_save(context);
+        cairo_translate(context, 0.0, offset);
+        draw_open_contents(context);
+        cairo_restore(context);
+    }
+
+    void draw_open_contents(cairo_t* context)
+    {
+        cairo_set_source_rgb(context, 0.965, 0.945, 0.90);
+        cairo_rectangle(context, 0.0, 0.0, static_cast<double>(width_), static_cast<double>(height_));
+        cairo_fill(context);
         cairo_set_source_rgb(context, 0.90, 0.31, 0.12);
         cairo_rectangle(context, 0.0, static_cast<double>(kStatusHeight - 3), static_cast<double>(width_), 3.0);
         cairo_fill(context);
@@ -1002,12 +1194,11 @@ private:
     void handle_press(int pointer_x, int pointer_y)
     {
         if (pointer_y < kStatusHeight) {
-            open_ = false;
             pending_confirmation_ = Confirmation::None;
             selected_network_index_ = -1;
             std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
             wifi_passphrase_.clear();
-            create_surface();
+            begin_close_animation();
             return;
         }
         if (pending_confirmation_ != Confirmation::None) {
@@ -1139,10 +1330,12 @@ private:
     wl_seat* seat_ = nullptr;
     wl_output* output_ = nullptr;
     wl_pointer* pointer_ = nullptr;
+    wl_touch* touch_ = nullptr;
     wl_keyboard* keyboard_ = nullptr;
     zwlr_layer_shell_v1* layer_shell_ = nullptr;
     wl_surface* surface_ = nullptr;
     zwlr_layer_surface_v1* layer_surface_ = nullptr;
+    wl_callback* frame_callback_ = nullptr;
     std::array<Buffer, 2> buffers_ {};
     void* mapping_ = nullptr;
     std::size_t mapping_length_ = 0;
@@ -1158,6 +1351,12 @@ private:
     int last_pointer_x_ = 0;
     int last_pointer_y_ = 0;
     bool gesture_active_ = false;
+    int active_touch_id_ = -1;
+    bool opened_by_touch_drag_ = false;
+    bool opening_animation_pending_ = false;
+    bool opening_animation_active_ = false;
+    bool closing_animation_active_ = false;
+    std::chrono::steady_clock::time_point animation_started_ {};
     bool left_shift_ = false;
     bool right_shift_ = false;
     bool open_ = false;
