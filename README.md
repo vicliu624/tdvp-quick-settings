@@ -6,18 +6,17 @@ enhancement: it does not own the window manager, desktop, NetworkManager,
 PulseAudio, or board GPIO policy.
 
 The first supported profile is the 1232×568 TDVP K230 desktop. The panel opens
-from a transparent 8px surface at the true display top edge, above the
-existing status panel. It is dismissed with an upward swipe begun in the
-bottom edge zone, and uses `wl_shm` plus Cairo directly. On
-the shipping Labwc profile, the existing 64px top panel remains visible and
-the drawer receives the remaining 1232×504 logical area; the layout is
-explicitly validated for both this profile and an unobstructed 1232×568
-output. It does not link GTK, Qt, WebKit, Electron, or an application shell.
+from a transparent 32px surface at the true display top edge and is dismissed
+with an upward swipe begun in the lower 112px zone. Once open, it is a full
+1232×568 layer-shell overlay: it paints over the existing status panel and
+receives input ahead of it, so panel widgets cannot appear through or receive
+clicks beneath the control center. It uses `wl_shm` plus Cairo directly and
+does not link GTK, Qt, WebKit, Electron, or an application shell.
 
 Opening and closing use a 180ms ease-out slide driven by Wayland frame
 callbacks. The animation translates the existing drawer content inside the
 same `wl_shm` buffers. To keep the K230 compositor smooth, the complete drawer
-is rasterized once into a temporary 2.37 MiB Cairo image and each animation
+is rasterized once into a temporary 2.67 MiB Cairo image and each animation
 frame only copies that image at a different vertical offset. The temporary
 image is released immediately after the transition; there is no idle timer,
 blur pass, screenshot cache, or persistent additional render target.
@@ -89,9 +88,9 @@ drawer buffers when closed.
 
 | State | Maximum dedicated graphics allocation |
 |---|---:|
-| Edge trigger only, two 1232×8 32-bit wl_shm buffers | 0.08 MiB |
-| 1232×504 drawer, two 32-bit wl_shm buffers | 4.74 MiB |
-| UI-owned graphics allocation while open | 4.74 MiB |
+| Edge trigger only, two 1232×32 32-bit wl_shm buffers | 0.30 MiB |
+| 1232×568 full-screen overlay, two 32-bit wl_shm buffers | 5.34 MiB |
+| UI-owned persistent graphics allocation while open | 5.34 MiB |
 
 See [docs/memory-budget.md](docs/memory-budget.md) and
 [docs/backend-protocol.md](docs/backend-protocol.md).

@@ -5,11 +5,11 @@ process has two modes.
 
 ## Hidden / idle
 
-* A transparent 1232×32 top-edge surface, intentionally above the existing
-  status panel's reserved work area, gives a physical touchscreen a forgiving
-  first downward-gesture hit target.
-* No separate status surface is retained; the existing desktop top panel stays
-  responsible for persistent status indicators.
+* A transparent 1232×32 top-edge surface gives a physical touchscreen a
+  forgiving first downward-gesture hit target.
+* No separate status surface is retained. When closed, the existing desktop
+  top panel owns its normal status indicators; when the drawer opens, the
+  full-screen Quick Settings overlay paints over it and receives all input.
 * There is no idle timer, background screenshot, blur, image cache, GTK scene
   graph, or polling worker thread. The 180ms open/close transition exists only
   while a drawer is moving and is driven by one Wayland frame callback at a
@@ -25,17 +25,17 @@ process has two modes.
 
 ## Open drawer
 
-The shipping Labwc profile reserves 64px for its existing top panel, so the
-drawer is 1232×504 and uses two 32-bit `wl_shm` buffers:
+The open control center intentionally covers the existing top panel, so the
+drawer is a 1232×568 full-screen overlay with two 32-bit `wl_shm` buffers:
 
 ```
-1232 × 504 × 4 × 2 = 4,967,424 bytes = 4.74 MiB
+1232 × 568 × 4 × 2 = 5,598,208 bytes = 5.34 MiB
 ```
 
 The drawer paints directly onto those buffers with Cairo. It does not allocate
 an additional persistent offscreen render target. During the 180ms opening or
-closing transition only, one 1232×504 ARGB32 Cairo image (2,483,712 bytes,
-2.37 MiB) caches the fully rasterized drawer. This avoids redrawing text and
+closing transition only, one 1232×568 ARGB32 Cairo image (2,799,104 bytes,
+2.67 MiB) caches the fully rasterized drawer. This avoids redrawing text and
 rounded paths on every frame; it is destroyed immediately when the transition
 ends. The image-level acceptance test records RSS/PSS for the actual linked
 library set and rejects persistent growth.

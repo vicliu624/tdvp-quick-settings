@@ -32,6 +32,7 @@ extern "C" {
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
+#include <signal.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -54,7 +55,10 @@ constexpr int kHiddenHeight = 32;
 // drag opens the full overlay before the pointer can leave it.
 constexpr int kGestureOpenDistance = 4;
 constexpr int kGestureCloseDistance = 24;
-constexpr int kBottomDismissZoneHeight = 32;
+// Requiring the final 32 px made the upward dismissal as easy to miss as the
+// original top trigger.  Keep the gesture confined to the screen's lower
+// portion without demanding a pixel-perfect starting point.
+constexpr int kBottomDismissZoneHeight = 112;
 constexpr auto kSliderUpdateInterval = std::chrono::milliseconds(45);
 constexpr int kStatusHeight = 48;
 constexpr int kDrawerAnimationDurationMs = 180;
@@ -801,13 +805,12 @@ private:
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
             zwlr_layer_surface_v1_set_size(layer_surface_, 0, kHiddenHeight);
         }
-        // The trigger must cover the *physical/logical* top edge rather than
-        // the work area below wf-panel-pi.  A negative exclusive zone asks the
-        // compositor not to move this transparent, non-reserving edge surface
-        // below another panel's reserved zone.  Once opened, use the normal
-        // work area so the drawer keeps the verified 1232x504 layout below
-        // the existing 64px status bar.
-        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface_, open_ ? 0 : -1);
+        // A control center is a modal overlay, not a second panel underneath
+        // wf-panel-pi. A negative exclusive zone keeps both the trigger and
+        // the open drawer at the physical display edge. In the open state this
+        // yields a 1232x568 surface that paints over, and receives input ahead
+        // of, the existing 64px top panel.
+        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface_, -1);
         zwlr_layer_surface_v1_set_keyboard_interactivity(
             layer_surface_, wifi_password_active() ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE
                                                    : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
@@ -1274,8 +1277,25 @@ private:
         }
     }
 
+    static void close_inherited_descriptors(int descriptor_to_keep)
+    {
+        // fork() duplicates the established Wayland connection. The worker
+        // must never retain it: a slow provider request would otherwise keep
+        // an old layer-shell surface alive after the UI process is restarted.
+        long descriptor_limit = sysconf(_SC_OPEN_MAX);
+        if (descriptor_limit <= 0)
+            descriptor_limit = 256;
+        descriptor_limit = std::min(descriptor_limit, 4096L);
+        for (int descriptor_index = 0; descriptor_index < descriptor_limit;
+             ++descriptor_index) {
+            if (descriptor_index != descriptor_to_keep)
+                (void)close(descriptor_index);
+        }
+    }
+
     static void run_slider_worker(int descriptor)
     {
+        close_inherited_descriptors(descriptor);
         for (;;) {
             pollfd poll_descriptor {descriptor, static_cast<short>(POLLIN | POLLHUP), 0};
             int ready = 0;
@@ -1374,6 +1394,8 @@ private:
             close(slider_worker_descriptor_);
             slider_worker_descriptor_ = -1;
         }
+        if (slider_worker_pid_ > 0)
+            (void)kill(slider_worker_pid_, SIGTERM);
         reap_slider_worker();
     }
 
