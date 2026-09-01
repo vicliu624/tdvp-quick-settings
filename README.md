@@ -13,13 +13,19 @@ receives input ahead of it, so panel widgets cannot appear through or receive
 clicks beneath the control center. It uses `wl_shm` plus Cairo directly and
 does not link GTK, Qt, WebKit, Electron, or an application shell.
 
-Opening uses a 180ms ease-out slide; closing uses a 220ms symmetric ease-in-out
-slide. Both are driven by Wayland frame callbacks and translate the existing drawer content inside the
-same `wl_shm` buffers. To keep the K230 compositor smooth, the complete drawer
-is rasterized once into a temporary 2.67 MiB Cairo image and each animation
-frame only copies that image at a different vertical offset. The temporary
-image is released immediately after the transition; there is no idle timer,
-blur pass, screenshot cache, or persistent additional render target.
+The drawer is a continuous, direct-manipulation control rather than an
+open/closed animation. While a finger is down, a single `revealed_px` value is
+set directly from its vertical displacement; the top portion of the drawer is
+clipped to exactly that height. Moving the finger back up immediately reduces
+the visible height. On release, velocity chooses a decisive fling direction;
+otherwise the drawer settles to the nearest stable state. A new touch cancels
+that short settle at its current rendered height, so the user can grab and
+reverse it midway. The only autonomous animation is this 90–220ms post-release
+settle, driven by Wayland frame callbacks. To keep the K230 compositor smooth,
+the complete drawer is rasterized once into a temporary 2.67 MiB Cairo image
+while it is being dragged or settled. The image is released immediately after
+the interaction; there is no idle timer, blur pass, screenshot cache, or
+persistent additional render target.
 
 ## Design boundaries
 
@@ -84,7 +90,8 @@ For a target image or normal Linux development host with `wayland-client`,
 ## Memory contract
 
 The UI maintains no animation loop while idle and does not hold the large
-drawer buffers when closed.
+drawer buffers when closed. The direct-drag snapshot exists only while the
+finger is manipulating the drawer or while its post-release settle runs.
 
 | State | Maximum dedicated graphics allocation |
 |---|---:|

@@ -1,4 +1,5 @@
 #include "core/controller.hpp"
+#include "core/drawer.hpp"
 #include "core/layout.hpp"
 #include "core/orientation.hpp"
 #include "core/status.hpp"
@@ -12,6 +13,7 @@ namespace {
 using tdvp::quick_settings::AuxiliaryTile;
 using tdvp::quick_settings::BackendCommandKind;
 using tdvp::quick_settings::Confirmation;
+using tdvp::quick_settings::DrawerSettleTarget;
 using tdvp::quick_settings::Extent;
 using tdvp::quick_settings::GpsState;
 using tdvp::quick_settings::HardwareSnapshot;
@@ -155,6 +157,40 @@ void test_other_logical_modes_are_not_silently_scaled()
     EXPECT(!layout.supported);
 }
 
+void test_drawer_follows_and_reverses_the_finger()
+{
+    EXPECT(tdvp::quick_settings::drawer_revealed_from_drag(0.0F, 220.0F, 568.0F) == 220.0F);
+    EXPECT(tdvp::quick_settings::drawer_revealed_from_drag(220.0F, -140.0F, 568.0F) == 80.0F);
+    EXPECT(tdvp::quick_settings::drawer_revealed_from_drag(80.0F, 800.0F, 568.0F) == 568.0F);
+    EXPECT(tdvp::quick_settings::drawer_revealed_from_drag(80.0F, -800.0F, 568.0F) == 0.0F);
+}
+
+void test_drawer_release_uses_velocity_then_nearest_state()
+{
+    EXPECT(tdvp::quick_settings::drawer_settle_target(120.0F, 568.0F, 0.0F) ==
+           DrawerSettleTarget::Collapsed);
+    EXPECT(tdvp::quick_settings::drawer_settle_target(420.0F, 568.0F, 0.0F) ==
+           DrawerSettleTarget::Expanded);
+    EXPECT(tdvp::quick_settings::drawer_settle_target(100.0F, 568.0F, 900.0F) ==
+           DrawerSettleTarget::Expanded);
+    EXPECT(tdvp::quick_settings::drawer_settle_target(480.0F, 568.0F, -900.0F) ==
+           DrawerSettleTarget::Collapsed);
+}
+
+void test_drawer_settle_starts_without_a_jump()
+{
+    const float start = 196.0F;
+    EXPECT(tdvp::quick_settings::drawer_settle_revealed(start, 568.0F,
+                                                         DrawerSettleTarget::Expanded, 0.0F) ==
+           start);
+    EXPECT(tdvp::quick_settings::drawer_settle_revealed(start, 568.0F,
+                                                         DrawerSettleTarget::Expanded, 1.0F) ==
+           568.0F);
+    EXPECT(tdvp::quick_settings::drawer_settle_duration_ms(start, 568.0F,
+                                                            DrawerSettleTarget::Expanded, 0.0F) >=
+           90);
+}
+
 void test_rotated_k230_surface_uses_landscape_buffer_and_input_coordinates()
 {
     const Extent raw_surface {568, 1232};
@@ -187,6 +223,9 @@ int main()
     test_target_layout_is_touch_safe_and_scroll_free();
     test_layout_fits_below_the_existing_top_panel();
     test_other_logical_modes_are_not_silently_scaled();
+    test_drawer_follows_and_reverses_the_finger();
+    test_drawer_release_uses_velocity_then_nearest_state();
+    test_drawer_settle_starts_without_a_jump();
     test_rotated_k230_surface_uses_landscape_buffer_and_input_coordinates();
     if (failures == 0) {
         std::cout << "all tdvp-quick-settings core tests passed\n";

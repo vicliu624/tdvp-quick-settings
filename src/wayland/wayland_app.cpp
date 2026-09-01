@@ -1,6 +1,7 @@
 #include "wayland/wayland_app.hpp"
 
 #include "core/controller.hpp"
+#include "core/drawer.hpp"
 #include "core/layout.hpp"
 #include "core/orientation.hpp"
 #include "core/state.hpp"
@@ -53,16 +54,14 @@ constexpr int kHiddenHeight = 32;
 // Wayland does not send pointer motion after it leaves the transparent edge
 // surface. Keep this deliberately below the edge strip so a genuine downward
 // drag opens the full overlay before the pointer can leave it.
-constexpr int kGestureOpenDistance = 4;
-constexpr int kGestureCloseDistance = 24;
+constexpr int kGestureTouchSlop = 12;
 // Requiring the final 32 px made the upward dismissal as easy to miss as the
 // original top trigger.  Keep the gesture confined to the screen's lower
 // portion without demanding a pixel-perfect starting point.
 constexpr int kBottomDismissZoneHeight = 112;
 constexpr auto kSliderUpdateInterval = std::chrono::milliseconds(45);
 constexpr int kStatusHeight = 48;
-constexpr int kDrawerOpenAnimationDurationMs = 180;
-constexpr int kDrawerCloseAnimationDurationMs = 220;
+constexpr int kFullDrawerHeight = 568;
 constexpr uint32_t kVersionCompositor = 4;
 constexpr uint32_t kVersionSeat = 5;
 constexpr uint32_t kVersionLayerShell = 4;
@@ -265,7 +264,7 @@ public:
         }
         open_ = open_on_start;
         if (open_) {
-            opening_animation_pending_ = true;
+            revealed_px_ = static_cast<float>(kFullDrawerHeight);
             refresh_state();
             refresh_wifi_networks();
         }
@@ -280,6 +279,12 @@ private:
         None,
         Pointer,
         Touch,
+    };
+
+    enum class DrawerGesture {
+        None,
+        Opening,
+        Closing,
     };
 
     static const wl_registry_listener& registry_listener()
@@ -565,12 +570,18 @@ private:
                 return;
             }
         }
-        if (self->open_ && self->opening_animation_pending_ &&
-            configured_height > kHiddenHeight) {
-            self->opening_animation_pending_ = false;
-            self->opening_animation_active_ = true;
-            self->animation_started_ = std::chrono::steady_clock::now();
+        if (self->open_ && self->full_drawer_configured() && self->opening_resize_in_progress_) {
+            self->revealed_px_ = clamp_drawer_revealed(self->pending_revealed_px_,
+                                                        static_cast<float>(self->height_));
+            self->drawer_drag_started_ = true;
+            self->opening_resize_in_progress_ = false;
             (void)self->create_animation_snapshot();
+            if (self->settle_after_resize_) {
+                self->settle_after_resize_ = false;
+                self->start_drawer_settle(self->pending_settle_target_,
+                                          self->vertical_velocity_px_per_second_);
+                return;
+            }
         }
         self->redraw();
     }
@@ -587,14 +598,14 @@ private:
         const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
                                                     wl_fixed_to_int(surface_y));
         self->last_pointer_x_ = point.x;
-        self->gesture_start_y_ = point.y;
         self->last_pointer_y_ = point.y;
-        self->gesture_active_ = true;
     }
 
     static void pointer_leave(void* data, wl_pointer*, uint32_t, wl_surface*)
     {
-        static_cast<Impl*>(data)->gesture_active_ = false;
+        auto* self = static_cast<Impl*>(data);
+        if (!self->pointer_button_down_)
+            self->pointer_drawer_gesture_active_ = false;
     }
 
     static void pointer_motion(void* data, wl_pointer*, uint32_t, wl_fixed_t surface_x,
@@ -609,20 +620,8 @@ private:
             self->update_active_slider(point.x, false);
             return;
         }
-        if (self->open_ && !self->closing_animation_active_ && self->gesture_active_ &&
-            self->gesture_start_y_ >= self->height_ - kBottomDismissZoneHeight &&
-            self->gesture_start_y_ - point.y >= kGestureCloseDistance) {
-            self->begin_close_animation();
-            return;
-        }
-        if (!self->open_ && self->gesture_active_ &&
-            point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
-            self->open_ = true;
-            self->opening_animation_pending_ = true;
-            self->refresh_state();
-            self->refresh_wifi_networks();
-            self->create_surface();
-        }
+        if (self->pointer_drawer_gesture_active_)
+            (void)self->update_drawer_gesture(point.y);
     }
 
     static void pointer_button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button,
@@ -632,21 +631,42 @@ private:
         const auto now = std::chrono::steady_clock::now();
         if (button != BTN_LEFT)
             return;
-        if (state == WL_POINTER_BUTTON_STATE_RELEASED &&
-            self->slider_drag_owner_ == SliderDragOwner::Pointer) {
-            self->update_active_slider(self->last_pointer_x_, true);
-            self->end_slider_drag();
+        if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+            // Some touchscreen stacks also emit a synthetic wl_pointer release
+            // after the wl_touch sequence. Only a button press that this
+            // pointer path actually accepted may complete a pointer click;
+            // otherwise a touch gesture could activate a card a second time.
+            if (!self->pointer_button_down_)
+                return;
+            const bool slider_drag = self->slider_drag_owner_ == SliderDragOwner::Pointer;
+            if (slider_drag) {
+                self->update_active_slider(self->last_pointer_x_, true);
+                self->end_slider_drag();
+            }
+            const bool consumed = self->pointer_drawer_gesture_active_ &&
+                                  self->finish_drawer_gesture();
+            self->pointer_drawer_gesture_active_ = false;
+            self->pointer_button_down_ = false;
+            if (self->open_ && !slider_drag && !consumed)
+                self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
             return;
         }
-        if (!self->open_ || state != WL_POINTER_BUTTON_STATE_PRESSED)
+        if (state != WL_POINTER_BUTTON_STATE_PRESSED)
             return;
         if (self->active_touch_id_ >= 0 || self->touch_event_is_recent(now))
             return;
         self->last_pointer_press_ = now;
-        if (self->begin_slider_drag(self->last_pointer_x_, self->last_pointer_y_,
+        self->pointer_button_down_ = true;
+        if (self->drawer_settling_) {
+            self->pointer_drawer_gesture_active_ =
+                self->begin_drawer_gesture(self->last_pointer_y_);
+            return;
+        }
+        if (self->open_ && self->full_drawer_configured() &&
+            self->begin_slider_drag(self->last_pointer_x_, self->last_pointer_y_,
                                     SliderDragOwner::Pointer))
             return;
-        self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
+        self->pointer_drawer_gesture_active_ = self->begin_drawer_gesture(self->last_pointer_y_);
     }
 
     static void pointer_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t)
@@ -687,11 +707,15 @@ private:
         self->active_touch_id_ = id;
         self->last_pointer_x_ = point.x;
         self->last_pointer_y_ = point.y;
-        self->gesture_start_y_ = point.y;
-        self->gesture_active_ = true;
-        self->closed_by_touch_drag_ = false;
-        if (self->begin_slider_drag(point.x, point.y, SliderDragOwner::Touch))
+        if (self->drawer_settling_) {
+            (void)self->begin_drawer_gesture(point.y);
             return;
+        }
+        if (self->open_ && self->full_drawer_configured() &&
+            self->begin_slider_drag(point.x, point.y, SliderDragOwner::Touch)) {
+            return;
+        }
+        (void)self->begin_drawer_gesture(point.y);
     }
 
     static void touch_up(void* data, wl_touch*, uint32_t, uint32_t, int32_t id)
@@ -699,19 +723,15 @@ private:
         auto* self = static_cast<Impl*>(data);
         if (id != self->active_touch_id_)
             return;
-        const bool opened_by_drag = self->opened_by_touch_drag_;
-        const bool closed_by_drag = self->closed_by_touch_drag_;
         const bool slider_drag = self->slider_drag_owner_ == SliderDragOwner::Touch;
         if (slider_drag) {
             self->update_active_slider(self->last_pointer_x_, true);
             self->end_slider_drag();
         }
+        const bool consumed = !slider_drag && self->finish_drawer_gesture();
         self->active_touch_id_ = -1;
-        self->gesture_active_ = false;
-        self->opened_by_touch_drag_ = false;
-        self->closed_by_touch_drag_ = false;
         self->last_touch_event_ = std::chrono::steady_clock::now();
-        if (self->open_ && !opened_by_drag && !closed_by_drag && !slider_drag)
+        if (self->open_ && !consumed && !slider_drag)
             self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
     }
 
@@ -729,21 +749,7 @@ private:
             self->update_active_slider(point.x, false);
             return;
         }
-        if (self->open_ && !self->closing_animation_active_ &&
-            self->gesture_start_y_ >= self->height_ - kBottomDismissZoneHeight &&
-            self->gesture_start_y_ - point.y >= kGestureCloseDistance) {
-            self->closed_by_touch_drag_ = true;
-            self->begin_close_animation();
-            return;
-        }
-        if (!self->open_ && point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
-            self->opened_by_touch_drag_ = true;
-            self->open_ = true;
-            self->opening_animation_pending_ = true;
-            self->refresh_state();
-            self->refresh_wifi_networks();
-            self->create_surface();
-        }
+        (void)self->update_drawer_gesture(point.y);
     }
 
     static void touch_frame(void*, wl_touch*)
@@ -753,10 +759,9 @@ private:
     static void touch_cancel(void* data, wl_touch*)
     {
         auto* self = static_cast<Impl*>(data);
+        if (self->slider_drag_owner_ != SliderDragOwner::Touch)
+            (void)self->finish_drawer_gesture();
         self->active_touch_id_ = -1;
-        self->gesture_active_ = false;
-        self->opened_by_touch_drag_ = false;
-        self->closed_by_touch_drag_ = false;
         if (self->slider_drag_owner_ == SliderDragOwner::Touch)
             self->end_slider_drag();
         self->last_touch_event_ = std::chrono::steady_clock::now();
@@ -783,7 +788,6 @@ private:
 
     void create_surface()
     {
-        destroy_surface();
         surface_ = wl_compositor_create_surface(compositor_);
         if (surface_ == nullptr) {
             running_ = false;
@@ -793,7 +797,15 @@ private:
         layer_surface_ = zwlr_layer_shell_v1_get_layer_surface(layer_shell_, surface_, output_, layer,
                                                                 "tdvp-quick-settings");
         zwlr_layer_surface_v1_add_listener(layer_surface_, &layer_listener(), this);
-        if (open_) {
+        request_surface_geometry(open_);
+    }
+
+    void request_surface_geometry(bool full_drawer)
+    {
+        if (layer_surface_ == nullptr || surface_ == nullptr)
+            return;
+        full_surface_requested_ = full_drawer;
+        if (full_drawer) {
             zwlr_layer_surface_v1_set_anchor(
                 layer_surface_, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
@@ -917,9 +929,202 @@ private:
                                   buffer_transform_);
     }
 
-    [[nodiscard]] bool animation_active() const
+    [[nodiscard]] bool full_drawer_configured() const
     {
-        return opening_animation_active_ || closing_animation_active_;
+        return full_surface_requested_ && width_ > 0 && height_ > kHiddenHeight;
+    }
+
+    [[nodiscard]] float drawer_extent_px() const
+    {
+        return static_cast<float>(height_ > kHiddenHeight ? height_ : kFullDrawerHeight);
+    }
+
+    [[nodiscard]] float drawer_settle_progress() const
+    {
+        if (!drawer_settling_ || drawer_settle_duration_ms_ <= 0)
+            return 1.0F;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - drawer_settle_started_);
+        return std::max(0.0F, std::min(1.0F, static_cast<float>(elapsed.count()) /
+                                                 static_cast<float>(drawer_settle_duration_ms_)));
+    }
+
+    [[nodiscard]] float presented_revealed_px() const
+    {
+        if (!drawer_settling_)
+            return clamp_drawer_revealed(revealed_px_, drawer_extent_px());
+        return drawer_settle_revealed(drawer_settle_start_px_, drawer_extent_px(),
+                                      drawer_settle_target_, drawer_settle_progress());
+    }
+
+    void cancel_drawer_settle()
+    {
+        if (!drawer_settling_)
+            return;
+        revealed_px_ = presented_revealed_px();
+        drawer_settling_ = false;
+        destroy_animation_snapshot();
+    }
+
+    void sample_drawer_velocity(float current_y)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (gesture_sample_time_.time_since_epoch().count() != 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - gesture_sample_time_);
+            if (elapsed.count() > 0) {
+                const float instantaneous =
+                    (current_y - last_gesture_y_) * 1000.0F / static_cast<float>(elapsed.count());
+                // A small amount of filtering avoids a spurious single touch-controller
+                // sample choosing the opposite settle direction, without introducing a
+                // visibly delayed response while the finger is still down.
+                vertical_velocity_px_per_second_ = vertical_velocity_px_per_second_ * 0.35F +
+                                                   instantaneous * 0.65F;
+            }
+        }
+        last_gesture_y_ = current_y;
+        gesture_sample_time_ = now;
+    }
+
+    [[nodiscard]] bool begin_drawer_gesture(int y)
+    {
+        const bool was_settling = drawer_settling_;
+        cancel_drawer_settle();
+        drawer_gesture_ = DrawerGesture::None;
+        drawer_drag_started_ = false;
+        revealed_on_down_px_ = presented_revealed_px();
+        gesture_origin_y_ = static_cast<float>(y);
+        last_gesture_y_ = gesture_origin_y_;
+        vertical_velocity_px_per_second_ = 0.0F;
+        gesture_sample_time_ = std::chrono::steady_clock::now();
+
+        if (!open_) {
+            drawer_gesture_ = DrawerGesture::Opening;
+            return true;
+        }
+        // A post-release settle is still the same physical drawer. Android
+        // lets a fresh touch take it over from the currently rendered height,
+        // regardless of where inside the exposed portion that touch lands.
+        // The generic direct-manipulation branch below accepts both movement
+        // directions, so the same path also reverses an in-progress close.
+        if (was_settling && full_drawer_configured()) {
+            drawer_gesture_ = DrawerGesture::Opening;
+            return true;
+        }
+        if (full_drawer_configured() && y >= height_ - kBottomDismissZoneHeight) {
+            drawer_gesture_ = DrawerGesture::Closing;
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool update_drawer_gesture(int y)
+    {
+        if (drawer_gesture_ == DrawerGesture::None)
+            return false;
+        sample_drawer_velocity(static_cast<float>(y));
+        const float displacement = static_cast<float>(y) - gesture_origin_y_;
+
+        if (drawer_gesture_ == DrawerGesture::Opening && !open_) {
+            // Keep the surface as the cheap 32px transparent edge until the
+            // finger has expressed an intentional pull.  The first expanded
+            // frame is nevertheless positioned at this exact displacement.
+            if (displacement <= static_cast<float>(kGestureTouchSlop))
+                return true;
+            open_ = true;
+            full_surface_requested_ = true;
+            opening_resize_in_progress_ = true;
+            pending_revealed_px_ = clamp_drawer_revealed(revealed_on_down_px_ + displacement,
+                                                         static_cast<float>(kFullDrawerHeight));
+            refresh_state();
+            refresh_wifi_networks();
+            request_surface_geometry(true);
+            return true;
+        }
+
+        if (drawer_gesture_ == DrawerGesture::Opening && !full_drawer_configured()) {
+            pending_revealed_px_ = clamp_drawer_revealed(revealed_on_down_px_ + displacement,
+                                                         static_cast<float>(kFullDrawerHeight));
+            return true;
+        }
+
+        if (!drawer_drag_started_ && std::abs(displacement) < static_cast<float>(kGestureTouchSlop))
+            return false;
+
+        drawer_drag_started_ = true;
+        revealed_px_ = drawer_revealed_from_drag(revealed_on_down_px_, displacement,
+                                                  drawer_extent_px());
+        if (animation_snapshot_ == nullptr)
+            (void)create_animation_snapshot();
+        redraw();
+        return true;
+    }
+
+    [[nodiscard]] bool finish_drawer_gesture()
+    {
+        const DrawerGesture gesture = drawer_gesture_;
+        drawer_gesture_ = DrawerGesture::None;
+        if (gesture == DrawerGesture::None)
+            return false;
+
+        if (gesture == DrawerGesture::Opening && !open_)
+            return true;
+
+        if (gesture == DrawerGesture::Opening && opening_resize_in_progress_) {
+            const float extent = static_cast<float>(kFullDrawerHeight);
+            pending_settle_target_ = drawer_settle_target(
+                pending_revealed_px_, extent, vertical_velocity_px_per_second_);
+            settle_after_resize_ = true;
+            drawer_drag_started_ = false;
+            return true;
+        }
+
+        if (!drawer_drag_started_)
+            return false;
+
+        const DrawerSettleTarget target = drawer_settle_target(
+            revealed_px_, drawer_extent_px(), vertical_velocity_px_per_second_);
+        drawer_drag_started_ = false;
+        start_drawer_settle(target, vertical_velocity_px_per_second_);
+        return true;
+    }
+
+    void start_drawer_settle(DrawerSettleTarget target, float velocity_px_per_second)
+    {
+        if (!full_drawer_configured())
+            return;
+        revealed_px_ = clamp_drawer_revealed(revealed_px_, drawer_extent_px());
+        drawer_settle_target_ = target;
+        const float target_px = target == DrawerSettleTarget::Expanded ? drawer_extent_px() : 0.0F;
+        if (std::abs(revealed_px_ - target_px) < 0.5F) {
+            revealed_px_ = target_px;
+            complete_drawer_settle();
+            return;
+        }
+        drawer_settle_start_px_ = revealed_px_;
+        drawer_settle_duration_ms_ = drawer_settle_duration_ms(
+            revealed_px_, drawer_extent_px(), target, velocity_px_per_second);
+        drawer_settle_started_ = std::chrono::steady_clock::now();
+        drawer_settling_ = true;
+        if (animation_snapshot_ == nullptr)
+            (void)create_animation_snapshot();
+        redraw();
+    }
+
+    void complete_drawer_settle()
+    {
+        revealed_px_ = drawer_settle_target_ == DrawerSettleTarget::Expanded ? drawer_extent_px()
+                                                                               : 0.0F;
+        drawer_settling_ = false;
+        destroy_animation_snapshot();
+        if (drawer_settle_target_ == DrawerSettleTarget::Collapsed) {
+            open_ = false;
+            full_surface_requested_ = false;
+            stop_slider_worker();
+            request_surface_geometry(false);
+            return;
+        }
+        redraw();
     }
 
     [[nodiscard]] bool touch_event_is_recent(std::chrono::steady_clock::time_point now) const
@@ -936,66 +1141,16 @@ private:
         return now - last_pointer_press_ < std::chrono::milliseconds(400);
     }
 
-    [[nodiscard]] double animation_progress() const
-    {
-        if (!animation_active())
-            return 1.0;
-        const int duration_ms = closing_animation_active_ ? kDrawerCloseAnimationDurationMs
-                                                            : kDrawerOpenAnimationDurationMs;
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - animation_started_);
-        return std::max(0.0, std::min(1.0,
-                                     static_cast<double>(elapsed.count()) /
-                                         static_cast<double>(duration_ms)));
-    }
-
-    [[nodiscard]] double visible_drawer_fraction() const
-    {
-        const double progress = animation_progress();
-        if (closing_animation_active_) {
-            // Reversing the opening ease-out makes 70% of the drawer vanish
-            // in the first third of the transition. A symmetric ease-in-out
-            // keeps the opening frame visible and then glides it upward.
-            const double eased = progress < 0.5
-                                     ? 4.0 * progress * progress * progress
-                                     : 1.0 - std::pow(-2.0 * progress + 2.0, 3.0) / 2.0;
-            return 1.0 - eased;
-        }
-        if (opening_animation_active_)
-            return 1.0 - std::pow(1.0 - progress, 3.0);
-        return 1.0;
-    }
-
-    void begin_close_animation()
-    {
-        if (!open_ || closing_animation_active_)
-            return;
-        opening_animation_pending_ = false;
-        opening_animation_active_ = false;
-        (void)create_animation_snapshot();
-        closing_animation_active_ = true;
-        animation_started_ = std::chrono::steady_clock::now();
-        redraw();
-    }
-
     static void frame_done(void* data, wl_callback* callback, uint32_t)
     {
         auto* self = static_cast<Impl*>(data);
         wl_callback_destroy(callback);
         self->frame_callback_ = nullptr;
-        if (!self->animation_active())
+        if (!self->drawer_settling_)
             return;
-        if (self->animation_progress() >= 1.0) {
-            if (self->closing_animation_active_) {
-                self->closing_animation_active_ = false;
-                self->destroy_animation_snapshot();
-                self->open_ = false;
-                self->stop_slider_worker();
-                self->create_surface();
-                return;
-            }
-            self->opening_animation_active_ = false;
-            self->destroy_animation_snapshot();
+        if (self->drawer_settle_progress() >= 1.0F) {
+            self->complete_drawer_settle();
+            return;
         }
         self->redraw();
     }
@@ -1047,7 +1202,7 @@ private:
         redraw_pending_ = false;
 
         cairo_t* context = cairo_create(buffer->cairo);
-        if (open_) {
+        if (open_ && full_drawer_configured()) {
             draw_open(context);
         } else {
             cairo_save(context);
@@ -1058,7 +1213,7 @@ private:
         }
         cairo_destroy(context);
         cairo_surface_flush(buffer->cairo);
-        if (animation_active() && frame_callback_ == nullptr) {
+        if (drawer_settling_ && frame_callback_ == nullptr) {
             frame_callback_ = wl_surface_frame(surface_);
             wl_callback_add_listener(frame_callback_, &frame_listener(), this);
         }
@@ -1076,10 +1231,15 @@ private:
         cairo_paint(context);
         cairo_restore(context);
 
-        const double offset = (visible_drawer_fraction() - 1.0) * static_cast<double>(height_);
+        // Android's shade exposes a progressively larger portion of a fixed
+        // panel from the display edge.  Cropping the content to `revealed_px`
+        // means its bottom edge stays exactly under the finger; translating a
+        // full-height texture would instead reveal the bottom rows first.
+        const double revealed = static_cast<double>(presented_revealed_px());
         cairo_save(context);
-        cairo_translate(context, 0.0, offset);
-        if (animation_active() && animation_snapshot_ != nullptr) {
+        cairo_rectangle(context, 0.0, 0.0, static_cast<double>(width_), revealed);
+        cairo_clip(context);
+        if (animation_snapshot_ != nullptr) {
             cairo_set_source_surface(context, animation_snapshot_, 0.0, 0.0);
             cairo_paint(context);
         } else {
@@ -1523,7 +1683,7 @@ private:
         selected_network_index_ = -1;
         wifi_passphrase_.clear();
         message_ = "Wi-Fi connection cancelled";
-        create_surface();
+        request_surface_geometry(open_);
     }
 
     void submit_wifi_password()
@@ -1545,7 +1705,7 @@ private:
         std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
         wifi_passphrase_.clear();
         message_ = started ? "Connecting to " + ssid : "Could not start Wi-Fi connection";
-        create_surface();
+        request_surface_geometry(open_);
     }
 
     [[nodiscard]] char password_character(uint32_t key) const
@@ -1698,8 +1858,10 @@ private:
             if (access("/usr/bin/swaylock", X_OK) == 0) {
                 launch_session_process({"/usr/bin/swaylock", "-f", "-c", "1f1e1b"});
                 open_ = false;
+                revealed_px_ = 0.0F;
+                full_surface_requested_ = false;
                 pending_confirmation_ = Confirmation::None;
-                create_surface();
+                request_surface_geometry(false);
                 return;
             }
             message_ = "Authenticated screen locking is not installed";
@@ -1730,7 +1892,7 @@ private:
                     std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
                     wifi_passphrase_.clear();
                     message_.clear();
-                    create_surface();
+                    request_surface_geometry(open_);
                     return;
                 } else if (request_wifi_connect(network)) {
                     message_ = "Connecting to " + network.ssid;
@@ -1782,16 +1944,29 @@ private:
     int output_mode_height_ = 0;
     SurfaceTransform output_transform_ = SurfaceTransform::Normal;
     SurfaceTransform buffer_transform_ = SurfaceTransform::Normal;
-    int gesture_start_y_ = 0;
     int last_pointer_x_ = 0;
     int last_pointer_y_ = 0;
-    bool gesture_active_ = false;
     int active_touch_id_ = -1;
-    bool opened_by_touch_drag_ = false;
-    bool opening_animation_pending_ = false;
-    bool opening_animation_active_ = false;
-    bool closing_animation_active_ = false;
-    std::chrono::steady_clock::time_point animation_started_ {};
+    DrawerGesture drawer_gesture_ = DrawerGesture::None;
+    DrawerSettleTarget pending_settle_target_ = DrawerSettleTarget::Collapsed;
+    DrawerSettleTarget drawer_settle_target_ = DrawerSettleTarget::Collapsed;
+    float revealed_px_ = 0.0F;
+    float revealed_on_down_px_ = 0.0F;
+    float pending_revealed_px_ = 0.0F;
+    float gesture_origin_y_ = 0.0F;
+    float last_gesture_y_ = 0.0F;
+    float vertical_velocity_px_per_second_ = 0.0F;
+    float drawer_settle_start_px_ = 0.0F;
+    int drawer_settle_duration_ms_ = 0;
+    bool full_surface_requested_ = false;
+    bool opening_resize_in_progress_ = false;
+    bool drawer_drag_started_ = false;
+    bool settle_after_resize_ = false;
+    bool drawer_settling_ = false;
+    bool pointer_button_down_ = false;
+    bool pointer_drawer_gesture_active_ = false;
+    std::chrono::steady_clock::time_point gesture_sample_time_ {};
+    std::chrono::steady_clock::time_point drawer_settle_started_ {};
     std::chrono::steady_clock::time_point last_touch_event_ {};
     std::chrono::steady_clock::time_point last_pointer_press_ {};
     std::chrono::steady_clock::time_point last_slider_enqueue_ {};
@@ -1800,7 +1975,6 @@ private:
     int slider_worker_descriptor_ = -1;
     SliderDragOwner slider_drag_owner_ = SliderDragOwner::None;
     int active_slider_ = -1;
-    bool closed_by_touch_drag_ = false;
     bool left_shift_ = false;
     bool right_shift_ = false;
     bool redraw_pending_ = false;
