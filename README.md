@@ -42,6 +42,11 @@ changes its local `On`/`Off` detail after `nmcli` confirms the requested radio
 state. The UI deliberately has no global toast area; status feedback stays in
 the control that initiated it.
 
+Audio Output is an active board-route control, not a status label. Its state
+changes only after the hardware provider reads back the K230 ALSA `External
+I2S Output Switch`: `Speaker` selects the external MAX98357A-compatible I2S
+route and `Internal` selects the internal codec path.
+
 The three continuous controls use Android-style touch capture rather than a
 desktop click: a finger pressed on a slider stays bound to that slider until
 release, movement updates its percentage and board setting in place, and it

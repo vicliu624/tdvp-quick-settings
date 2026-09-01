@@ -1068,14 +1068,17 @@ private:
                                             ? wifi_feedback_
                                             : (snapshot_.wifi_connected ? "Connected" :
                                                (snapshot_.wifi_enabled ? "On" : "Off"));
-        const char* audio_detail = snapshot_.audio_output == "external" ? "Speaker" :
-                                   (snapshot_.audio_output == "internal" ? "Internal" : "Unavailable");
+        const std::string audio_detail = !audio_feedback_.empty()
+                                             ? audio_feedback_
+                                             : (snapshot_.audio_output == "external" ? "Speaker" :
+                                                (snapshot_.audio_output == "internal" ? "Internal" :
+                                                                                         "Unavailable"));
         const char* lora_detail = snapshot_.lora_enabled ? "On" : "Off";
         const char* fourth_title = model.fourth_primary_tile == AuxiliaryTile::Gps ? "GPS" : "On-screen Keyboard";
         const char* fourth_detail = model.fourth_primary_tile == AuxiliaryTile::Gps
                                          ? model.gps_detail.c_str() : "Show keyboard";
         draw_card(context, layout.primary_cards[0], "Wi-Fi", wifi_detail.c_str());
-        draw_card(context, layout.primary_cards[1], "Audio Output", audio_detail);
+        draw_card(context, layout.primary_cards[1], "Audio Output", audio_detail.c_str());
         draw_card(context, layout.primary_cards[2], "LoRa", lora_detail);
         draw_card(context, layout.primary_cards[3], fourth_title, fourth_detail);
         draw_slider(context, layout.sliders[0], "Volume", snapshot_.volume_percent,
@@ -1181,6 +1184,7 @@ private:
         if (reply.ok) {
             snapshot_ = reply.snapshot;
             wifi_feedback_.clear();
+            audio_feedback_.clear();
             message_.clear();
         } else {
             message_ = reply.error;
@@ -1320,6 +1324,28 @@ private:
         wifi_scan_ = {};
         if (target_enabled)
             (void)request_wifi_rescan();
+        redraw();
+    }
+
+    void toggle_audio_output()
+    {
+        const std::string target = snapshot_.audio_output == "external" ? "internal" : "external";
+        const ProviderReply reply = provider_.request("SET speaker-route " + target);
+        if (!reply.ok) {
+            audio_feedback_ = "Unavailable";
+            redraw();
+            return;
+        }
+        snapshot_ = reply.snapshot;
+        // The provider reads the ALSA route control after tdvp-audio-route
+        // returns. Do not claim a switch until that readback agrees.
+        if (snapshot_.audio_output != target) {
+            audio_feedback_ = "Unavailable";
+            redraw();
+            return;
+        }
+        audio_feedback_ = target == "external" ? "Speaker" : "Internal";
+        message_.clear();
         redraw();
     }
 
@@ -1477,7 +1503,7 @@ private:
             toggle_wifi();
             return;
         } else if (layout.primary_cards[1].contains(pointer_x, pointer_y)) {
-            execute_provider(snapshot_.audio_output == "external" ? "SET speaker-route internal" : "SET speaker-route external");
+            toggle_audio_output();
             return;
         } else if (layout.primary_cards[2].contains(pointer_x, pointer_y)) {
             execute_radio_action(snapshot_.lora_enabled ? RequestedAction::DisableLora : RequestedAction::EnableLora, false);
@@ -1618,6 +1644,7 @@ private:
     WifiScanResult wifi_scan_;
     std::string message_;
     std::string wifi_feedback_;
+    std::string audio_feedback_;
     int selected_network_index_ = -1;
     std::string wifi_passphrase_;
     RequestedAction pending_action_ = RequestedAction::EnableLora;
