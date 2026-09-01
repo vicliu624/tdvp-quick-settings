@@ -597,7 +597,13 @@ private:
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
             zwlr_layer_surface_v1_set_size(layer_surface_, 0, kHiddenHeight);
         }
-        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface_, 0);
+        // The trigger must cover the *physical/logical* top edge rather than
+        // the work area below wf-panel-pi.  A negative exclusive zone asks the
+        // compositor not to move this transparent, non-reserving edge surface
+        // below another panel's reserved zone.  Once opened, use the normal
+        // work area so the drawer keeps the verified 1232x504 layout below
+        // the existing 64px status bar.
+        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface_, open_ ? 0 : -1);
         zwlr_layer_surface_v1_set_keyboard_interactivity(
             layer_surface_, wifi_password_active() ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE
                                                    : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);

@@ -6,7 +6,8 @@ enhancement: it does not own the window manager, desktop, NetworkManager,
 PulseAudio, or board GPIO policy.
 
 The first supported profile is the 1232×568 TDVP K230 desktop. The panel opens
-from a thin top-edge gesture surface and uses `wl_shm` plus Cairo directly. On
+from a transparent 8px surface at the true display top edge, above the
+existing status panel, and uses `wl_shm` plus Cairo directly. On
 the shipping Labwc profile, the existing 64px top panel remains visible and
 the drawer receives the remaining 1232×504 logical area; the layout is
 explicitly validated for both this profile and an unobstructed 1232×568

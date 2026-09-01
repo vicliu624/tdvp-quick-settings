@@ -5,7 +5,8 @@ process has two modes.
 
 ## Hidden / idle
 
-* A transparent 1232×8 top-edge surface detects the first downward gesture.
+* A transparent 1232×8 top-edge surface, intentionally above the existing
+  status panel's reserved work area, detects the first downward gesture.
 * No separate status surface is retained; the existing desktop top panel stays
   responsible for persistent status indicators.
 * There is no timer-driven animation, background screenshot, blur, image cache,
