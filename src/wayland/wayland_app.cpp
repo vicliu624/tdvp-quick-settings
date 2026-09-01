@@ -29,9 +29,12 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <linux/input-event-codes.h>
+#include <poll.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -61,7 +64,13 @@ struct Buffer {
     cairo_surface_t* cairo = nullptr;
     std::uint8_t* data = nullptr;
     std::size_t length = 0;
+    void* owner = nullptr;
     bool busy = false;
+};
+
+struct SliderWorkerRequest {
+    int slider = -1;
+    int percent = 0;
 };
 
 int create_anonymous_file(std::size_t size)
@@ -207,6 +216,7 @@ class WaylandApp::Impl {
 public:
     ~Impl()
     {
+        stop_slider_worker();
         destroy_surface();
         if (output_ != nullptr)
             wl_output_destroy(output_);
@@ -251,8 +261,8 @@ public:
             refresh_wifi_networks();
         }
         create_surface();
-        while (running_ && wl_display_dispatch(display_) != -1) {
-        }
+        while (running_ && wl_display_dispatch(display_) != -1)
+            reap_slider_worker();
         return 0;
     }
 
@@ -753,7 +763,13 @@ private:
 
     static void buffer_release(void* data, wl_buffer*)
     {
-        static_cast<Buffer*>(data)->busy = false;
+        auto* buffer = static_cast<Buffer*>(data);
+        buffer->busy = false;
+        auto* self = static_cast<Impl*>(buffer->owner);
+        if (self != nullptr && self->surface_ != nullptr && self->redraw_pending_) {
+            self->redraw_pending_ = false;
+            self->redraw();
+        }
     }
 
     void create_surface()
@@ -846,6 +862,7 @@ private:
             const std::size_t offset = index * frame_length;
             buffer.data = static_cast<std::uint8_t*>(mapping_) + offset;
             buffer.length = frame_length;
+            buffer.owner = this;
             buffer.cairo = cairo_image_surface_create_for_data(buffer.data, CAIRO_FORMAT_ARGB32, width_, height_, stride);
             buffer.wl = wl_shm_pool_create_buffer(pool, static_cast<int>(offset), width_, height_, stride,
                                                    WL_SHM_FORMAT_ARGB8888);
@@ -862,6 +879,7 @@ private:
 
     void destroy_buffers()
     {
+        redraw_pending_ = false;
         for (Buffer& buffer : buffers_) {
             if (buffer.wl != nullptr) {
                 wl_buffer_destroy(buffer.wl);
@@ -873,6 +891,7 @@ private:
             }
             buffer.data = nullptr;
             buffer.length = 0;
+            buffer.owner = nullptr;
             buffer.busy = false;
         }
         if (mapping_ != nullptr) {
@@ -955,6 +974,7 @@ private:
                 self->closing_animation_active_ = false;
                 self->destroy_animation_snapshot();
                 self->open_ = false;
+                self->stop_slider_worker();
                 self->create_surface();
                 return;
             }
@@ -1004,8 +1024,11 @@ private:
                 break;
             }
         }
-        if (buffer == nullptr || buffer->cairo == nullptr)
+        if (buffer == nullptr || buffer->cairo == nullptr) {
+            redraw_pending_ = true;
             return;
+        }
+        redraw_pending_ = false;
 
         cairo_t* context = cairo_create(buffer->cairo);
         if (open_) {
@@ -1233,7 +1256,7 @@ private:
         }
     }
 
-    [[nodiscard]] const char* slider_command_name(int slider) const
+    [[nodiscard]] static const char* slider_command_name(int slider)
     {
         switch (slider) {
         case 0:
@@ -1247,6 +1270,126 @@ private:
         }
     }
 
+    static void run_slider_worker(int descriptor)
+    {
+        for (;;) {
+            pollfd poll_descriptor {descriptor, static_cast<short>(POLLIN | POLLHUP), 0};
+            int ready = 0;
+            do {
+                ready = poll(&poll_descriptor, 1, -1);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0)
+                break;
+
+            SliderWorkerRequest newest;
+            const ssize_t received = recv(descriptor, &newest, sizeof(newest), MSG_DONTWAIT);
+            if (received == 0)
+                break;
+            if (received < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                    continue;
+                break;
+            }
+            if (received != static_cast<ssize_t>(sizeof(newest)))
+                continue;
+
+            // Keep only the most recent finger position while a hardware
+            // request is in flight. This prevents a slow backlight or ALSA
+            // command from turning a drag into a long, stale FIFO.
+            for (;;) {
+                SliderWorkerRequest newer;
+                const ssize_t drained = recv(descriptor, &newer, sizeof(newer), MSG_DONTWAIT);
+                if (drained == static_cast<ssize_t>(sizeof(newer))) {
+                    newest = newer;
+                    continue;
+                }
+                if (drained < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+
+            const char* command_name = slider_command_name(newest.slider);
+            if (command_name != nullptr) {
+                ProviderClient provider;
+                (void)provider.request("SET " + std::string(command_name) + " " +
+                                       std::to_string(newest.percent));
+            }
+        }
+        close(descriptor);
+        _exit(0);
+    }
+
+    void reap_slider_worker()
+    {
+        if (slider_worker_pid_ <= 0)
+            return;
+        int status = 0;
+        const pid_t finished = waitpid(slider_worker_pid_, &status, WNOHANG);
+        if (finished != slider_worker_pid_)
+            return;
+        slider_worker_pid_ = -1;
+        if (slider_worker_descriptor_ >= 0) {
+            close(slider_worker_descriptor_);
+            slider_worker_descriptor_ = -1;
+        }
+    }
+
+    [[nodiscard]] bool ensure_slider_worker()
+    {
+        reap_slider_worker();
+        if (slider_worker_descriptor_ >= 0)
+            return true;
+        int descriptors[2] {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, descriptors) != 0)
+            return false;
+        const int flags = fcntl(descriptors[0], F_GETFL, 0);
+        if (flags < 0 || fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+            close(descriptors[0]);
+            close(descriptors[1]);
+            return false;
+        }
+        const pid_t child = fork();
+        if (child < 0) {
+            close(descriptors[0]);
+            close(descriptors[1]);
+            return false;
+        }
+        if (child == 0) {
+            close(descriptors[0]);
+            run_slider_worker(descriptors[1]);
+        }
+        close(descriptors[1]);
+        slider_worker_pid_ = child;
+        slider_worker_descriptor_ = descriptors[0];
+        return true;
+    }
+
+    void stop_slider_worker()
+    {
+        if (slider_worker_descriptor_ >= 0) {
+            close(slider_worker_descriptor_);
+            slider_worker_descriptor_ = -1;
+        }
+        reap_slider_worker();
+    }
+
+    [[nodiscard]] bool queue_slider_value(int slider, int percent)
+    {
+        if (!ensure_slider_worker())
+            return false;
+        const SliderWorkerRequest request {slider, percent};
+        const ssize_t sent = send(slider_worker_descriptor_, &request, sizeof(request),
+                                  MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent == static_cast<ssize_t>(sizeof(request)))
+            return true;
+        if (sent < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+            close(slider_worker_descriptor_);
+            slider_worker_descriptor_ = -1;
+            reap_slider_worker();
+        }
+        return false;
+    }
+
     bool begin_slider_drag(int pointer_x, int pointer_y, SliderDragOwner owner)
     {
         const int slider = slider_at(pointer_x, pointer_y);
@@ -1254,7 +1397,7 @@ private:
             return false;
         active_slider_ = slider;
         slider_drag_owner_ = owner;
-        last_slider_sent_[static_cast<std::size_t>(slider)] = -1;
+        last_slider_enqueued_[static_cast<std::size_t>(slider)] = -1;
         update_active_slider(pointer_x, true);
         return true;
     }
@@ -1274,28 +1417,14 @@ private:
         set_slider_snapshot_value(active_slider_, percent);
 
         const auto now = std::chrono::steady_clock::now();
-        if (last_slider_sent_[index] == percent ||
-            (!final_value && now - last_slider_provider_update_ < kSliderUpdateInterval)) {
+        if (last_slider_enqueued_[index] == percent ||
+            (!final_value && now - last_slider_enqueue_ < kSliderUpdateInterval)) {
             redraw();
             return;
         }
-        const char* command_name = slider_command_name(active_slider_);
-        if (command_name == nullptr) {
-            redraw();
-            return;
-        }
-        last_slider_sent_[index] = percent;
-        last_slider_provider_update_ = now;
-        const ProviderReply reply =
-            provider_.request("SET " + std::string(command_name) + " " + std::to_string(percent));
-        if (reply.ok) {
-            snapshot_ = reply.snapshot;
-            // Keep the thumb under the user's finger even if the provider
-            // rounds a hardware value in its status reply.
-            set_slider_snapshot_value(active_slider_, percent);
-            message_.clear();
-        } else {
-            message_ = reply.error;
+        if (queue_slider_value(active_slider_, percent)) {
+            last_slider_enqueued_[index] = percent;
+            last_slider_enqueue_ = now;
         }
         redraw();
     }
@@ -1630,13 +1759,16 @@ private:
     std::chrono::steady_clock::time_point animation_started_ {};
     std::chrono::steady_clock::time_point last_touch_event_ {};
     std::chrono::steady_clock::time_point last_pointer_press_ {};
-    std::chrono::steady_clock::time_point last_slider_provider_update_ {};
-    std::array<int, 3> last_slider_sent_ {{-1, -1, -1}};
+    std::chrono::steady_clock::time_point last_slider_enqueue_ {};
+    std::array<int, 3> last_slider_enqueued_ {{-1, -1, -1}};
+    pid_t slider_worker_pid_ = -1;
+    int slider_worker_descriptor_ = -1;
     SliderDragOwner slider_drag_owner_ = SliderDragOwner::None;
     int active_slider_ = -1;
     bool closed_by_touch_drag_ = false;
     bool left_shift_ = false;
     bool right_shift_ = false;
+    bool redraw_pending_ = false;
     bool open_ = false;
     bool running_ = true;
     ProviderClient provider_;

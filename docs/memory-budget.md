@@ -13,6 +13,11 @@ process has two modes.
   graph, or polling worker thread. The 180ms open/close transition exists only
   while a drawer is moving and is driven by one Wayland frame callback at a
   time.
+* A slider interaction may create one short-lived helper process with a small
+  Unix socketpair. It is not created while the edge trigger is idle, owns no
+  graphics buffers, coalesces hardware writes to the latest finger position,
+  and exits when the drawer closes. It is deliberately not a resident service
+  or polling worker.
 * The two `wl_shm` buffers consume 78,848 bytes (0.08 MiB). Process RSS/PSS
   remains an image-level measured acceptance value rather than an unsupported
   static claim.

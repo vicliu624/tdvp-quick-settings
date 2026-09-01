@@ -54,6 +54,14 @@ cannot accidentally dismiss the drawer. Volume and screen brightness occupy
 two broad controls; keyboard backlight has its own full-width control below
 them.
 
+Slider drawing is deliberately decoupled from board I/O. The Wayland input
+callback updates and redraws the thumb immediately; while the drawer is open,
+the first slider write creates one short-lived helper which coalesces queued
+positions and applies only the newest position after a slow hardware request.
+It is stopped when the drawer closes. This keeps a lagging I2C, ALSA, or GPIO
+operation from blocking touch motion, and does not add a resident service,
+thread, or polling loop.
+
 The K230 profile has an important radio constraint: LR2021 LoRa and the
 optional keyboard-mounted nRF9151 LTE/GNSS module are electrically mutually
 exclusive. A GPS control is visible only after the firmware provider has
