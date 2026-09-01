@@ -44,10 +44,14 @@ extern "C" {
 namespace tdvp::quick_settings {
 namespace {
 
-constexpr int kHiddenHeight = 8;
+// A physical touchscreen needs a forgiving hit target: an 8 px strip is easy
+// to miss through controller jitter or a status-panel hit test.  The hidden
+// layer remains transparent, but covers the upper half of the 64 px status
+// bar so a normal Android-style pull-down begins in our surface reliably.
+constexpr int kHiddenHeight = 32;
 // Wayland does not send pointer motion after it leaves the transparent edge
-// surface.  Keep this deliberately below the 8 px input strip so a genuine
-// downward drag opens the full overlay before the pointer can leave it.
+// surface. Keep this deliberately below the edge strip so a genuine downward
+// drag opens the full overlay before the pointer can leave it.
 constexpr int kGestureOpenDistance = 4;
 constexpr int kGestureCloseDistance = 24;
 constexpr int kBottomDismissZoneHeight = 32;

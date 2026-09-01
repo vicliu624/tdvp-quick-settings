@@ -5,8 +5,9 @@ process has two modes.
 
 ## Hidden / idle
 
-* A transparent 1232×8 top-edge surface, intentionally above the existing
-  status panel's reserved work area, detects the first downward gesture.
+* A transparent 1232×32 top-edge surface, intentionally above the existing
+  status panel's reserved work area, gives a physical touchscreen a forgiving
+  first downward-gesture hit target.
 * No separate status surface is retained; the existing desktop top panel stays
   responsible for persistent status indicators.
 * There is no idle timer, background screenshot, blur, image cache, GTK scene
@@ -18,7 +19,7 @@ process has two modes.
   graphics buffers, coalesces hardware writes to the latest finger position,
   and exits when the drawer closes. It is deliberately not a resident service
   or polling worker.
-* The two `wl_shm` buffers consume 78,848 bytes (0.08 MiB). Process RSS/PSS
+* The two `wl_shm` buffers consume 315,392 bytes (0.30 MiB). Process RSS/PSS
   remains an image-level measured acceptance value rather than an unsupported
   static claim.
 
