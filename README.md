@@ -7,7 +7,8 @@ PulseAudio, or board GPIO policy.
 
 The first supported profile is the 1232×568 TDVP K230 desktop. The panel opens
 from a transparent 8px surface at the true display top edge, above the
-existing status panel, and uses `wl_shm` plus Cairo directly. On
+existing status panel. It is dismissed with an upward swipe begun in the
+bottom edge zone, and uses `wl_shm` plus Cairo directly. On
 the shipping Labwc profile, the existing 64px top panel remains visible and
 the drawer receives the remaining 1232×504 logical area; the layout is
 explicitly validated for both this profile and an unobstructed 1232×568
@@ -35,6 +36,11 @@ There is deliberately no fallback-mode controller, watchdog, panel restart
 loop, or special recovery desktop in this project. The established Linux
 desktop components already provide those independent interaction paths; Quick
 Settings only adds the top-edge touch gesture and its overlay.
+
+Wi-Fi actions are executed synchronously through NetworkManager: a card only
+changes its local `On`/`Off` detail after `nmcli` confirms the requested radio
+state. The UI deliberately has no global toast area; status feedback stays in
+the control that initiated it.
 
 The K230 profile has an important radio constraint: LR2021 LoRa and the
 optional keyboard-mounted nRF9151 LTE/GNSS module are electrically mutually

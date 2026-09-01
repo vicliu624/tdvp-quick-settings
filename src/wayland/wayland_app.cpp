@@ -46,6 +46,8 @@ constexpr int kHiddenHeight = 8;
 // surface.  Keep this deliberately below the 8 px input strip so a genuine
 // downward drag opens the full overlay before the pointer can leave it.
 constexpr int kGestureOpenDistance = 4;
+constexpr int kGestureCloseDistance = 28;
+constexpr int kBottomDismissZoneHeight = 96;
 constexpr int kStatusHeight = 48;
 constexpr int kDrawerAnimationDurationMs = 180;
 constexpr uint32_t kVersionCompositor = 4;
@@ -569,6 +571,12 @@ private:
                                                     wl_fixed_to_int(surface_y));
         self->last_pointer_x_ = point.x;
         self->last_pointer_y_ = point.y;
+        if (self->open_ && !self->closing_animation_active_ && self->gesture_active_ &&
+            self->gesture_start_y_ >= self->height_ - kBottomDismissZoneHeight &&
+            self->gesture_start_y_ - point.y >= kGestureCloseDistance) {
+            self->begin_close_animation();
+            return;
+        }
         if (!self->open_ && self->gesture_active_ &&
             point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
             self->open_ = true;
@@ -583,8 +591,12 @@ private:
                                uint32_t state)
     {
         auto* self = static_cast<Impl*>(data);
+        const auto now = std::chrono::steady_clock::now();
         if (!self->open_ || button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED)
             return;
+        if (self->active_touch_id_ >= 0 || self->touch_event_is_recent(now))
+            return;
+        self->last_pointer_press_ = now;
         self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
     }
 
@@ -617,6 +629,9 @@ private:
         // while the first finger is opening or dragging the drawer.
         if (self->active_touch_id_ >= 0)
             return;
+        const auto now = std::chrono::steady_clock::now();
+        self->suppress_touch_press_ = self->pointer_press_is_recent(now);
+        self->last_touch_event_ = now;
         const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
                                                     wl_fixed_to_int(surface_y));
         self->active_touch_id_ = id;
@@ -624,6 +639,7 @@ private:
         self->last_pointer_y_ = point.y;
         self->gesture_start_y_ = point.y;
         self->gesture_active_ = true;
+        self->closed_by_touch_drag_ = false;
     }
 
     static void touch_up(void* data, wl_touch*, uint32_t, uint32_t, int32_t id)
@@ -632,10 +648,15 @@ private:
         if (id != self->active_touch_id_)
             return;
         const bool opened_by_drag = self->opened_by_touch_drag_;
+        const bool closed_by_drag = self->closed_by_touch_drag_;
+        const bool suppress_touch_press = self->suppress_touch_press_;
         self->active_touch_id_ = -1;
         self->gesture_active_ = false;
         self->opened_by_touch_drag_ = false;
-        if (self->open_ && !opened_by_drag)
+        self->closed_by_touch_drag_ = false;
+        self->suppress_touch_press_ = false;
+        self->last_touch_event_ = std::chrono::steady_clock::now();
+        if (self->open_ && !opened_by_drag && !closed_by_drag && !suppress_touch_press)
             self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
     }
 
@@ -649,6 +670,13 @@ private:
                                                     wl_fixed_to_int(surface_y));
         self->last_pointer_x_ = point.x;
         self->last_pointer_y_ = point.y;
+        if (self->open_ && !self->closing_animation_active_ &&
+            self->gesture_start_y_ >= self->height_ - kBottomDismissZoneHeight &&
+            self->gesture_start_y_ - point.y >= kGestureCloseDistance) {
+            self->closed_by_touch_drag_ = true;
+            self->begin_close_animation();
+            return;
+        }
         if (!self->open_ && point.y - self->gesture_start_y_ >= kGestureOpenDistance) {
             self->opened_by_touch_drag_ = true;
             self->open_ = true;
@@ -669,6 +697,9 @@ private:
         self->active_touch_id_ = -1;
         self->gesture_active_ = false;
         self->opened_by_touch_drag_ = false;
+        self->closed_by_touch_drag_ = false;
+        self->suppress_touch_press_ = false;
+        self->last_touch_event_ = std::chrono::steady_clock::now();
     }
 
     static void touch_shape(void*, wl_touch*, int32_t, wl_fixed_t, wl_fixed_t)
@@ -823,6 +854,20 @@ private:
         return opening_animation_active_ || closing_animation_active_;
     }
 
+    [[nodiscard]] bool touch_event_is_recent(std::chrono::steady_clock::time_point now) const
+    {
+        if (last_touch_event_.time_since_epoch().count() == 0)
+            return false;
+        return now - last_touch_event_ < std::chrono::milliseconds(400);
+    }
+
+    [[nodiscard]] bool pointer_press_is_recent(std::chrono::steady_clock::time_point now) const
+    {
+        if (last_pointer_press_.time_since_epoch().count() == 0)
+            return false;
+        return now - last_pointer_press_ < std::chrono::milliseconds(400);
+    }
+
     [[nodiscard]] double animation_progress() const
     {
         if (!animation_active())
@@ -973,21 +1018,22 @@ private:
         cairo_fill(context);
         cairo_set_source_rgb(context, 0.15, 0.15, 0.13);
         draw_text(context, 24.0, 31.0, 18.0, "Quick Settings", true);
-        draw_text(context, static_cast<double>(width_ - 74), 31.0, 14.0, "Close");
 
         const QuickSettingsModel model = derive_model(snapshot_);
         const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
         if (!layout.supported)
             return;
-        const char* wifi_detail = snapshot_.wifi_connected ? "Connected" :
-                                  (snapshot_.wifi_enabled ? "On" : "Off");
+        const std::string wifi_detail = !wifi_feedback_.empty()
+                                            ? wifi_feedback_
+                                            : (snapshot_.wifi_connected ? "Connected" :
+                                               (snapshot_.wifi_enabled ? "On" : "Off"));
         const char* audio_detail = snapshot_.audio_output == "external" ? "Speaker" :
                                    (snapshot_.audio_output == "internal" ? "Internal" : "Unavailable");
         const char* lora_detail = snapshot_.lora_enabled ? "On" : "Off";
         const char* fourth_title = model.fourth_primary_tile == AuxiliaryTile::Gps ? "GPS" : "On-screen Keyboard";
         const char* fourth_detail = model.fourth_primary_tile == AuxiliaryTile::Gps
                                          ? model.gps_detail.c_str() : "Show keyboard";
-        draw_card(context, layout.primary_cards[0], "Wi-Fi", wifi_detail);
+        draw_card(context, layout.primary_cards[0], "Wi-Fi", wifi_detail.c_str());
         draw_card(context, layout.primary_cards[1], "Audio Output", audio_detail);
         draw_card(context, layout.primary_cards[2], "LoRa", lora_detail);
         draw_card(context, layout.primary_cards[3], fourth_title, fourth_detail);
@@ -1032,10 +1078,6 @@ private:
         }
         draw_card(context, layout.network_settings, "Refresh networks", "Use NetworkManager scan");
 
-        if (!message_.empty()) {
-            cairo_set_source_rgb(context, 0.52, 0.18, 0.08);
-            draw_text(context, 24.0, static_cast<double>(height_ - 14), 13.0, message_.c_str());
-        }
         if (pending_confirmation_ != Confirmation::None)
             draw_confirmation(context);
         else if (wifi_password_active())
@@ -1094,6 +1136,7 @@ private:
         const ProviderReply reply = provider_.state();
         if (reply.ok) {
             snapshot_ = reply.snapshot;
+            wifi_feedback_.clear();
             message_.clear();
         } else {
             message_ = reply.error;
@@ -1108,6 +1151,26 @@ private:
         wifi_scan_ = scan_wifi_networks();
         if (wifi_scan_.ok)
             (void)request_wifi_rescan();
+    }
+
+    void toggle_wifi()
+    {
+        const bool target_enabled = !snapshot_.wifi_enabled;
+        if (!request_wifi_radio(target_enabled)) {
+            wifi_feedback_ = "Unavailable";
+            redraw();
+            return;
+        }
+        // nmcli completed successfully. Reflect that authoritative result in
+        // the card immediately instead of waiting for a later provider poll.
+        // The next drawer opening refreshes the full board snapshot again.
+        snapshot_.wifi_enabled = target_enabled;
+        snapshot_.wifi_connected = false;
+        wifi_feedback_ = target_enabled ? "On" : "Off";
+        wifi_scan_ = {};
+        if (target_enabled)
+            (void)request_wifi_rescan();
+        redraw();
     }
 
     [[nodiscard]] bool wifi_password_active() const
@@ -1234,14 +1297,8 @@ private:
 
     void handle_press(int pointer_x, int pointer_y)
     {
-        if (pointer_y < kStatusHeight) {
-            pending_confirmation_ = Confirmation::None;
-            selected_network_index_ = -1;
-            std::fill(wifi_passphrase_.begin(), wifi_passphrase_.end(), '\0');
-            wifi_passphrase_.clear();
-            begin_close_animation();
+        if (pointer_y < kStatusHeight)
             return;
-        }
         if (pending_confirmation_ != Confirmation::None) {
             const Rect cancel {368, 290, 208, 48};
             const Rect confirm {656, 290, 208, 48};
@@ -1267,10 +1324,8 @@ private:
         if (!layout.supported)
             return;
         if (layout.primary_cards[0].contains(pointer_x, pointer_y)) {
-            if (request_wifi_radio(!snapshot_.wifi_enabled))
-                message_ = snapshot_.wifi_enabled ? "Turning Wi-Fi off" : "Turning Wi-Fi on";
-            else
-                message_ = "Could not start NetworkManager Wi-Fi request";
+            toggle_wifi();
+            return;
         } else if (layout.primary_cards[1].contains(pointer_x, pointer_y)) {
             execute_provider(snapshot_.audio_output == "external" ? "SET speaker-route internal" : "SET speaker-route external");
             return;
@@ -1315,10 +1370,8 @@ private:
             execute_provider("SYSTEM poweroff");
             return;
         } else if (layout.network_toggle.contains(pointer_x, pointer_y)) {
-            if (request_wifi_radio(!snapshot_.wifi_enabled))
-                message_ = snapshot_.wifi_enabled ? "Turning Wi-Fi off" : "Turning Wi-Fi on";
-            else
-                message_ = "Could not start NetworkManager Wi-Fi request";
+            toggle_wifi();
+            return;
         } else {
             bool network_selected = false;
             for (std::size_t index = 0; index < layout.network_rows.size(); ++index) {
@@ -1399,6 +1452,10 @@ private:
     bool opening_animation_active_ = false;
     bool closing_animation_active_ = false;
     std::chrono::steady_clock::time_point animation_started_ {};
+    std::chrono::steady_clock::time_point last_touch_event_ {};
+    std::chrono::steady_clock::time_point last_pointer_press_ {};
+    bool closed_by_touch_drag_ = false;
+    bool suppress_touch_press_ = false;
     bool left_shift_ = false;
     bool right_shift_ = false;
     bool open_ = false;
@@ -1407,6 +1464,7 @@ private:
     HardwareSnapshot snapshot_;
     WifiScanResult wifi_scan_;
     std::string message_;
+    std::string wifi_feedback_;
     int selected_network_index_ = -1;
     std::string wifi_passphrase_;
     RequestedAction pending_action_ = RequestedAction::EnableLora;

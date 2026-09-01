@@ -113,6 +113,28 @@ CommandResult run_capture(const std::vector<std::string>& arguments)
     return result;
 }
 
+bool read_wifi_radio_enabled(bool& enabled)
+{
+    const CommandResult result = run_capture({kNmcliPath, "-g", "WIFI", "general"});
+    if (result.exit_status != 0)
+        return false;
+
+    const std::size_t first = result.output.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return false;
+    const std::size_t last = result.output.find_last_not_of(" \t\r\n");
+    const std::string value = result.output.substr(first, last - first + 1U);
+    if (value == "enabled") {
+        enabled = true;
+        return true;
+    }
+    if (value == "disabled") {
+        enabled = false;
+        return true;
+    }
+    return false;
+}
+
 bool run_detached(const std::vector<std::string>& arguments)
 {
     if (arguments.empty())
@@ -239,7 +261,16 @@ bool request_wifi_rescan()
 
 bool request_wifi_radio(bool enabled)
 {
-    return run_detached({kNmcliPath, "radio", "wifi", enabled ? "on" : "off"});
+    // Radio enable/disable is a small, local NetworkManager D-Bus operation.
+    // Wait for nmcli's result instead of treating the successful fork of a
+    // detached process as success: otherwise a rejected re-enable request
+    // leaves the tile showing an optimistic, incorrect state.
+    const CommandResult result =
+        run_capture({kNmcliPath, "radio", "wifi", enabled ? "on" : "off"});
+    if (result.exit_status != 0)
+        return false;
+    bool actual_enabled = false;
+    return read_wifi_radio_enabled(actual_enabled) && actual_enabled == enabled;
 }
 
 bool request_wifi_connect(const WifiNetwork& network, const std::string& passphrase)
