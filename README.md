@@ -15,8 +15,11 @@ output. It does not link GTK, Qt, WebKit, Electron, or an application shell.
 
 Opening and closing use a 180ms ease-out slide driven by Wayland frame
 callbacks. The animation translates the existing drawer content inside the
-same `wl_shm` buffers; it has no idle timer, blur pass, screenshot cache, or
-additional render target.
+same `wl_shm` buffers. To keep the K230 compositor smooth, the complete drawer
+is rasterized once into a temporary 2.37 MiB Cairo image and each animation
+frame only copies that image at a different vertical offset. The temporary
+image is released immediately after the transition; there is no idle timer,
+blur pass, screenshot cache, or persistent additional render target.
 
 ## Design boundaries
 

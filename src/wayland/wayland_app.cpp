@@ -534,6 +534,7 @@ private:
             self->opening_animation_pending_ = false;
             self->opening_animation_active_ = true;
             self->animation_started_ = std::chrono::steady_clock::now();
+            (void)self->create_animation_snapshot();
         }
         self->redraw();
     }
@@ -727,6 +728,7 @@ private:
             wl_callback_destroy(frame_callback_);
             frame_callback_ = nullptr;
         }
+        destroy_animation_snapshot();
         destroy_buffers();
         if (layer_surface_ != nullptr) {
             zwlr_layer_surface_v1_destroy(layer_surface_);
@@ -849,6 +851,7 @@ private:
             return;
         opening_animation_pending_ = false;
         opening_animation_active_ = false;
+        (void)create_animation_snapshot();
         closing_animation_active_ = true;
         animation_started_ = std::chrono::steady_clock::now();
         redraw();
@@ -864,13 +867,46 @@ private:
         if (self->animation_progress() >= 1.0) {
             if (self->closing_animation_active_) {
                 self->closing_animation_active_ = false;
+                self->destroy_animation_snapshot();
                 self->open_ = false;
                 self->create_surface();
                 return;
             }
             self->opening_animation_active_ = false;
+            self->destroy_animation_snapshot();
         }
         self->redraw();
+    }
+
+    bool create_animation_snapshot()
+    {
+        destroy_animation_snapshot();
+        if (width_ <= 0 || height_ <= 0)
+            return false;
+        animation_snapshot_ = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width_, height_);
+        if (animation_snapshot_ == nullptr ||
+            cairo_surface_status(animation_snapshot_) != CAIRO_STATUS_SUCCESS) {
+            destroy_animation_snapshot();
+            return false;
+        }
+        cairo_t* context = cairo_create(animation_snapshot_);
+        if (cairo_status(context) != CAIRO_STATUS_SUCCESS) {
+            cairo_destroy(context);
+            destroy_animation_snapshot();
+            return false;
+        }
+        draw_open_contents(context);
+        cairo_destroy(context);
+        cairo_surface_flush(animation_snapshot_);
+        return true;
+    }
+
+    void destroy_animation_snapshot()
+    {
+        if (animation_snapshot_ != nullptr) {
+            cairo_surface_destroy(animation_snapshot_);
+            animation_snapshot_ = nullptr;
+        }
     }
 
     void redraw()
@@ -918,7 +954,12 @@ private:
         const double offset = (visible_drawer_fraction() - 1.0) * static_cast<double>(height_);
         cairo_save(context);
         cairo_translate(context, 0.0, offset);
-        draw_open_contents(context);
+        if (animation_active() && animation_snapshot_ != nullptr) {
+            cairo_set_source_surface(context, animation_snapshot_, 0.0, 0.0);
+            cairo_paint(context);
+        } else {
+            draw_open_contents(context);
+        }
         cairo_restore(context);
     }
 
@@ -1336,6 +1377,7 @@ private:
     wl_surface* surface_ = nullptr;
     zwlr_layer_surface_v1* layer_surface_ = nullptr;
     wl_callback* frame_callback_ = nullptr;
+    cairo_surface_t* animation_snapshot_ = nullptr;
     std::array<Buffer, 2> buffers_ {};
     void* mapping_ = nullptr;
     std::size_t mapping_length_ = 0;

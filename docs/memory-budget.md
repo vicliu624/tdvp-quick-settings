@@ -27,8 +27,12 @@ drawer is 1232×504 and uses two 32-bit `wl_shm` buffers:
 ```
 
 The drawer paints directly onto those buffers with Cairo. It does not allocate
-an additional offscreen render target. The image-level acceptance test records
-RSS/PSS for the actual linked library set and rejects persistent growth.
+an additional persistent offscreen render target. During the 180ms opening or
+closing transition only, one 1232×504 ARGB32 Cairo image (2,483,712 bytes,
+2.37 MiB) caches the fully rasterized drawer. This avoids redrawing text and
+rounded paths on every frame; it is destroyed immediately when the transition
+ends. The image-level acceptance test records RSS/PSS for the actual linked
+library set and rejects persistent growth.
 
 The image-level acceptance test must open and close the drawer thirty times,
 then compare `smaps_rollup` after sixty seconds. Any persistent growth is a
