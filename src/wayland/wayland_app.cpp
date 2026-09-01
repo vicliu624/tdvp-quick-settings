@@ -46,8 +46,9 @@ constexpr int kHiddenHeight = 8;
 // surface.  Keep this deliberately below the 8 px input strip so a genuine
 // downward drag opens the full overlay before the pointer can leave it.
 constexpr int kGestureOpenDistance = 4;
-constexpr int kGestureCloseDistance = 28;
-constexpr int kBottomDismissZoneHeight = 96;
+constexpr int kGestureCloseDistance = 24;
+constexpr int kBottomDismissZoneHeight = 32;
+constexpr auto kSliderUpdateInterval = std::chrono::milliseconds(45);
 constexpr int kStatusHeight = 48;
 constexpr int kDrawerAnimationDurationMs = 180;
 constexpr uint32_t kVersionCompositor = 4;
@@ -132,24 +133,32 @@ void draw_card(cairo_t* context, const Rect& rect, const char* title, const char
     }
 }
 
-void draw_slider(cairo_t* context, const Rect& rect, const char* title, int percent)
+void draw_slider(cairo_t* context, const Rect& rect, const char* title, int percent,
+                 bool slider_active)
 {
     draw_card(context, rect, title, "");
-    const double y = static_cast<double>(rect.y + 72);
-    const double start = static_cast<double>(rect.x + 22);
-    const double width = static_cast<double>(rect.width - 44);
-    const double active = width * static_cast<double>(percent) / 100.0;
-    cairo_set_line_width(context, 6.0);
+    percent = std::max(0, std::min(100, percent));
+    const std::string percent_text = std::to_string(percent) + "%";
+    cairo_set_source_rgb(context, 0.31, 0.30, 0.27);
+    draw_text(context, static_cast<double>(rect.x + rect.width - 54),
+              static_cast<double>(rect.y + 34), 15.0, percent_text.c_str(), true);
+
+    const double y = static_cast<double>(rect.y + rect.height - 27);
+    const double start = static_cast<double>(rect.x + 26);
+    const double width = static_cast<double>(rect.width - 52);
+    const double filled = width * static_cast<double>(percent) / 100.0;
+    cairo_set_line_width(context, 12.0);
     cairo_set_line_cap(context, CAIRO_LINE_CAP_ROUND);
     cairo_set_source_rgb(context, 0.82, 0.80, 0.75);
     cairo_move_to(context, start, y);
     cairo_line_to(context, start + width, y);
     cairo_stroke(context);
-    cairo_set_source_rgb(context, 0.92, 0.30, 0.11);
+    cairo_set_source_rgb(context, slider_active ? 0.78 : 0.92, slider_active ? 0.20 : 0.30,
+                         slider_active ? 0.06 : 0.11);
     cairo_move_to(context, start, y);
-    cairo_line_to(context, start + active, y);
+    cairo_line_to(context, start + filled, y);
     cairo_stroke(context);
-    cairo_arc(context, start + active, y, 9.0, 0.0, 2.0 * M_PI);
+    cairo_arc(context, start + filled, y, slider_active ? 15.0 : 13.0, 0.0, 2.0 * M_PI);
     cairo_fill(context);
 }
 
@@ -248,6 +257,12 @@ public:
     }
 
 private:
+    enum class SliderDragOwner {
+        None,
+        Pointer,
+        Touch,
+    };
+
     static const wl_registry_listener& registry_listener()
     {
         static wl_registry_listener listener {};
@@ -571,6 +586,10 @@ private:
                                                     wl_fixed_to_int(surface_y));
         self->last_pointer_x_ = point.x;
         self->last_pointer_y_ = point.y;
+        if (self->slider_drag_owner_ == SliderDragOwner::Pointer) {
+            self->update_active_slider(point.x, false);
+            return;
+        }
         if (self->open_ && !self->closing_animation_active_ && self->gesture_active_ &&
             self->gesture_start_y_ >= self->height_ - kBottomDismissZoneHeight &&
             self->gesture_start_y_ - point.y >= kGestureCloseDistance) {
@@ -592,11 +611,22 @@ private:
     {
         auto* self = static_cast<Impl*>(data);
         const auto now = std::chrono::steady_clock::now();
-        if (!self->open_ || button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED)
+        if (button != BTN_LEFT)
+            return;
+        if (state == WL_POINTER_BUTTON_STATE_RELEASED &&
+            self->slider_drag_owner_ == SliderDragOwner::Pointer) {
+            self->update_active_slider(self->last_pointer_x_, true);
+            self->end_slider_drag();
+            return;
+        }
+        if (!self->open_ || state != WL_POINTER_BUTTON_STATE_PRESSED)
             return;
         if (self->active_touch_id_ >= 0 || self->touch_event_is_recent(now))
             return;
         self->last_pointer_press_ = now;
+        if (self->begin_slider_drag(self->last_pointer_x_, self->last_pointer_y_,
+                                    SliderDragOwner::Pointer))
+            return;
         self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
     }
 
@@ -630,8 +660,9 @@ private:
         if (self->active_touch_id_ >= 0)
             return;
         const auto now = std::chrono::steady_clock::now();
-        self->suppress_touch_press_ = self->pointer_press_is_recent(now);
         self->last_touch_event_ = now;
+        if (self->pointer_press_is_recent(now))
+            return;
         const Point point = self->map_surface_point(wl_fixed_to_int(surface_x),
                                                     wl_fixed_to_int(surface_y));
         self->active_touch_id_ = id;
@@ -640,6 +671,8 @@ private:
         self->gesture_start_y_ = point.y;
         self->gesture_active_ = true;
         self->closed_by_touch_drag_ = false;
+        if (self->begin_slider_drag(point.x, point.y, SliderDragOwner::Touch))
+            return;
     }
 
     static void touch_up(void* data, wl_touch*, uint32_t, uint32_t, int32_t id)
@@ -649,14 +682,17 @@ private:
             return;
         const bool opened_by_drag = self->opened_by_touch_drag_;
         const bool closed_by_drag = self->closed_by_touch_drag_;
-        const bool suppress_touch_press = self->suppress_touch_press_;
+        const bool slider_drag = self->slider_drag_owner_ == SliderDragOwner::Touch;
+        if (slider_drag) {
+            self->update_active_slider(self->last_pointer_x_, true);
+            self->end_slider_drag();
+        }
         self->active_touch_id_ = -1;
         self->gesture_active_ = false;
         self->opened_by_touch_drag_ = false;
         self->closed_by_touch_drag_ = false;
-        self->suppress_touch_press_ = false;
         self->last_touch_event_ = std::chrono::steady_clock::now();
-        if (self->open_ && !opened_by_drag && !closed_by_drag && !suppress_touch_press)
+        if (self->open_ && !opened_by_drag && !closed_by_drag && !slider_drag)
             self->handle_press(self->last_pointer_x_, self->last_pointer_y_);
     }
 
@@ -670,6 +706,10 @@ private:
                                                     wl_fixed_to_int(surface_y));
         self->last_pointer_x_ = point.x;
         self->last_pointer_y_ = point.y;
+        if (self->slider_drag_owner_ == SliderDragOwner::Touch) {
+            self->update_active_slider(point.x, false);
+            return;
+        }
         if (self->open_ && !self->closing_animation_active_ &&
             self->gesture_start_y_ >= self->height_ - kBottomDismissZoneHeight &&
             self->gesture_start_y_ - point.y >= kGestureCloseDistance) {
@@ -698,7 +738,8 @@ private:
         self->gesture_active_ = false;
         self->opened_by_touch_drag_ = false;
         self->closed_by_touch_drag_ = false;
-        self->suppress_touch_press_ = false;
+        if (self->slider_drag_owner_ == SliderDragOwner::Touch)
+            self->end_slider_drag();
         self->last_touch_event_ = std::chrono::steady_clock::now();
     }
 
@@ -1037,11 +1078,14 @@ private:
         draw_card(context, layout.primary_cards[1], "Audio Output", audio_detail);
         draw_card(context, layout.primary_cards[2], "LoRa", lora_detail);
         draw_card(context, layout.primary_cards[3], fourth_title, fourth_detail);
-        draw_slider(context, layout.sliders[0], "Volume", snapshot_.volume_percent > 0 ? snapshot_.volume_percent : 60);
+        draw_slider(context, layout.sliders[0], "Volume", snapshot_.volume_percent,
+                    active_slider_ == 0);
         draw_slider(context, layout.sliders[1], "Screen Brightness",
-                    snapshot_.display_brightness_percent > 0 ? snapshot_.display_brightness_percent : 60);
+                    snapshot_.display_brightness_percent,
+                    active_slider_ == 1);
         draw_slider(context, layout.sliders[2], "Keyboard Backlight",
-                    snapshot_.keyboard_backlight_percent > 0 ? snapshot_.keyboard_backlight_percent : 45);
+                    snapshot_.keyboard_backlight_percent,
+                    active_slider_ == 2);
         draw_card(context, layout.secondary_actions[0], snapshot_.muted ? "Unmute" : "Mute", "Audio control");
         draw_card(context, layout.secondary_actions[1], "Settings", "System settings");
         draw_card(context, layout.system_actions[0], "Lock", "Lock session");
@@ -1151,6 +1195,112 @@ private:
         wifi_scan_ = scan_wifi_networks();
         if (wifi_scan_.ok)
             (void)request_wifi_rescan();
+    }
+
+    [[nodiscard]] int slider_at(int pointer_x, int pointer_y) const
+    {
+        if (pending_confirmation_ != Confirmation::None || wifi_password_active())
+            return -1;
+        const QuickSettingsModel model = derive_model(snapshot_);
+        const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
+        if (!layout.supported)
+            return -1;
+        for (std::size_t index = 0; index < layout.sliders.size(); ++index) {
+            if (layout.sliders[index].contains(pointer_x, pointer_y))
+                return static_cast<int>(index);
+        }
+        return -1;
+    }
+
+    void set_slider_snapshot_value(int slider, int percent)
+    {
+        switch (slider) {
+        case 0:
+            snapshot_.volume_percent = percent;
+            break;
+        case 1:
+            snapshot_.display_brightness_percent = percent;
+            break;
+        case 2:
+            snapshot_.keyboard_backlight_percent = percent;
+            break;
+        default:
+            break;
+        }
+    }
+
+    [[nodiscard]] const char* slider_command_name(int slider) const
+    {
+        switch (slider) {
+        case 0:
+            return "speaker-volume";
+        case 1:
+            return "display-brightness";
+        case 2:
+            return "keyboard-backlight";
+        default:
+            return nullptr;
+        }
+    }
+
+    bool begin_slider_drag(int pointer_x, int pointer_y, SliderDragOwner owner)
+    {
+        const int slider = slider_at(pointer_x, pointer_y);
+        if (slider < 0)
+            return false;
+        active_slider_ = slider;
+        slider_drag_owner_ = owner;
+        last_slider_sent_[static_cast<std::size_t>(slider)] = -1;
+        update_active_slider(pointer_x, true);
+        return true;
+    }
+
+    void update_active_slider(int pointer_x, bool final_value)
+    {
+        if (active_slider_ < 0)
+            return;
+        const QuickSettingsModel model = derive_model(snapshot_);
+        const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
+        if (!layout.supported) {
+            end_slider_drag();
+            return;
+        }
+        const std::size_t index = static_cast<std::size_t>(active_slider_);
+        const int percent = slider_percent(layout.sliders[index], pointer_x);
+        set_slider_snapshot_value(active_slider_, percent);
+
+        const auto now = std::chrono::steady_clock::now();
+        if (last_slider_sent_[index] == percent ||
+            (!final_value && now - last_slider_provider_update_ < kSliderUpdateInterval)) {
+            redraw();
+            return;
+        }
+        const char* command_name = slider_command_name(active_slider_);
+        if (command_name == nullptr) {
+            redraw();
+            return;
+        }
+        last_slider_sent_[index] = percent;
+        last_slider_provider_update_ = now;
+        const ProviderReply reply =
+            provider_.request("SET " + std::string(command_name) + " " + std::to_string(percent));
+        if (reply.ok) {
+            snapshot_ = reply.snapshot;
+            // Keep the thumb under the user's finger even if the provider
+            // rounds a hardware value in its status reply.
+            set_slider_snapshot_value(active_slider_, percent);
+            message_.clear();
+        } else {
+            message_ = reply.error;
+        }
+        redraw();
+    }
+
+    void end_slider_drag()
+    {
+        active_slider_ = -1;
+        slider_drag_owner_ = SliderDragOwner::None;
+        redraw();
     }
 
     void toggle_wifi()
@@ -1454,8 +1604,11 @@ private:
     std::chrono::steady_clock::time_point animation_started_ {};
     std::chrono::steady_clock::time_point last_touch_event_ {};
     std::chrono::steady_clock::time_point last_pointer_press_ {};
+    std::chrono::steady_clock::time_point last_slider_provider_update_ {};
+    std::array<int, 3> last_slider_sent_ {{-1, -1, -1}};
+    SliderDragOwner slider_drag_owner_ = SliderDragOwner::None;
+    int active_slider_ = -1;
     bool closed_by_touch_drag_ = false;
-    bool suppress_touch_press_ = false;
     bool left_shift_ = false;
     bool right_shift_ = false;
     bool open_ = false;

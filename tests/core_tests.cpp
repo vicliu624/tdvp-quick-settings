@@ -128,7 +128,9 @@ void test_target_layout_is_touch_safe_and_scroll_free()
     EXPECT(tdvp::quick_settings::valid_layout(layout, Extent {1232, 568}));
     EXPECT(layout.primary_cards[0].width == 207);
     EXPECT(layout.primary_cards[0].height == 100);
-    EXPECT(layout.sliders[0].width == 280);
+    EXPECT(layout.sliders[0].width == 426);
+    EXPECT(layout.sliders[2].width == 864);
+    EXPECT(!layout.sliders[0].intersects(layout.sliders[2]));
     EXPECT(layout.network_settings.y + layout.network_settings.height == 544);
 }
 
@@ -140,6 +142,8 @@ void test_layout_fits_below_the_existing_top_panel()
     EXPECT(layout.supported);
     EXPECT(tdvp::quick_settings::valid_layout(layout, Extent {1232, 504}));
     EXPECT(layout.primary_cards[0].y == 64);
+    EXPECT(layout.sliders[2].width == 864);
+    EXPECT(layout.system_actions[2].y + layout.system_actions[2].height < 504);
     EXPECT(layout.network_settings.y + layout.network_settings.height <= 504);
 }
 

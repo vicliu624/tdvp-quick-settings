@@ -17,12 +17,10 @@ constexpr int kNetworkWidth = 280;
 constexpr int kCardGap = 12;
 constexpr int kPrimaryY = 112;
 constexpr int kPrimaryHeight = 100;
-constexpr int kSliderY = 223;
-constexpr int kSliderHeight = 109;
-constexpr int kSecondaryY = 344;
-constexpr int kSecondaryHeight = 60;
-constexpr int kSystemY = 416;
-constexpr int kSystemHeight = 56;
+constexpr int kSliderY = 224;
+constexpr int kSliderHeight = 90;
+constexpr int kSecondaryHeight = 56;
+constexpr int kSystemHeight = 48;
 
 Rect row_rect(int x, int y, int width, int height)
 {
@@ -56,17 +54,18 @@ QuickSettingsLayout make_layout(Extent display, const QuickSettingsModel& model)
         (display.height != kTargetHeight && display.height != kAvailableHeightBelowPanel))
         return layout;
 
-    const int compressed = kTargetHeight - display.height;
-    const int primary_y = kPrimaryY - (compressed * 3 / 4);
-    const int primary_height = kPrimaryHeight - (compressed * 10 / 64);
-    const int slider_y = kSliderY - (compressed * 59 / 64);
-    const int slider_height = kSliderHeight - (compressed * 13 / 64);
-    const int secondary_y = kSecondaryY - (compressed * 74 / 64);
-    const int secondary_height = kSecondaryHeight - (compressed * 6 / 64);
-    const int system_y = kSystemY - (compressed * 82 / 64);
-    const int system_height = kSystemHeight - (compressed * 6 / 64);
-    const int network_row_y = 168 - (compressed * 48 / 64);
-    const int network_settings_y = 492 - (compressed * 60 / 64);
+    const bool panel_reserved = display.height == kAvailableHeightBelowPanel;
+    const int primary_y = panel_reserved ? 64 : kPrimaryY;
+    const int primary_height = panel_reserved ? 90 : kPrimaryHeight;
+    const int slider_y = panel_reserved ? 166 : kSliderY;
+    const int slider_height = panel_reserved ? 82 : kSliderHeight;
+    const int keyboard_slider_y = slider_y + slider_height + kCardGap;
+    const int secondary_y = keyboard_slider_y + slider_height + kCardGap;
+    const int secondary_height = panel_reserved ? 54 : kSecondaryHeight;
+    const int system_y = secondary_y + secondary_height + kCardGap;
+    const int system_height = panel_reserved ? 48 : kSystemHeight;
+    const int network_row_y = panel_reserved ? 120 : 168;
+    const int network_settings_y = panel_reserved ? 432 : 492;
 
     layout.supported = true;
     layout.requires_vertical_scroll = false;
@@ -79,11 +78,13 @@ QuickSettingsLayout make_layout(Extent display, const QuickSettingsModel& model)
             row_rect(kOuterMargin + index * (primary_width + kCardGap), primary_y, primary_width,
                      primary_height);
 
-    const int slider_width = (kMainWidth - (2 * kCardGap)) / 3;
-    for (int index = 0; index < 3; ++index)
-        layout.sliders[static_cast<std::size_t>(index)] =
-            row_rect(kOuterMargin + index * (slider_width + kCardGap), slider_y, slider_width,
-                     slider_height);
+    // Two broad top-row controls and one full-width keyboard-light control are
+    // deliberately easier to grip than three narrow desktop-style sliders.
+    const int half_slider_width = (kMainWidth - kCardGap) / 2;
+    layout.sliders[0] = row_rect(kOuterMargin, slider_y, half_slider_width, slider_height);
+    layout.sliders[1] = row_rect(kOuterMargin + half_slider_width + kCardGap, slider_y,
+                                 half_slider_width, slider_height);
+    layout.sliders[2] = row_rect(kOuterMargin, keyboard_slider_y, kMainWidth, slider_height);
 
     const int secondary_width = (kMainWidth - kCardGap) / 2;
     layout.secondary_actions[0] = row_rect(kOuterMargin, secondary_y, secondary_width, secondary_height);

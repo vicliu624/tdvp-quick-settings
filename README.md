@@ -42,6 +42,13 @@ changes its local `On`/`Off` detail after `nmcli` confirms the requested radio
 state. The UI deliberately has no global toast area; status feedback stays in
 the control that initiated it.
 
+The three continuous controls use Android-style touch capture rather than a
+desktop click: a finger pressed on a slider stays bound to that slider until
+release, movement updates its percentage and board setting in place, and it
+cannot accidentally dismiss the drawer. Volume and screen brightness occupy
+two broad controls; keyboard backlight has its own full-width control below
+them.
+
 The K230 profile has an important radio constraint: LR2021 LoRa and the
 optional keyboard-mounted nRF9151 LTE/GNSS module are electrically mutually
 exclusive. A GPS control is visible only after the firmware provider has
