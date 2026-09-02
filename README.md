@@ -5,13 +5,15 @@ center for touch-first Linux handhelds. It is intentionally an optional desktop
 enhancement: it does not own the window manager, desktop, NetworkManager,
 PulseAudio, or board GPIO policy.
 
-The first supported profile is the 1232×568 TDVP K230 desktop. The panel opens
-from a transparent 32px surface at the true display top edge and is dismissed
-with an upward swipe begun in the lower 112px zone. Once open, it is a full
-1232×568 layer-shell overlay: it paints over the existing status panel and
-receives input ahead of it, so panel widgets cannot appear through or receive
-clicks beneath the control center. It uses `wl_shm` plus Cairo directly and
-does not link GTK, Qt, WebKit, Electron, or an application shell.
+The first supported profile is the 1232×568 TDVP K230 desktop. The client keeps
+one full-output, transparent layer-shell surface from session start, but limits
+its Wayland input region to a 32px strip at the true display top edge while the
+drawer is closed. That gives a physical touchscreen a forgiving trigger without
+letting the transparent part intercept normal desktop input. Once the pull
+crosses its threshold, the drawer becomes a modal full-output input surface and
+paints over the existing status panel, so panel widgets cannot appear through or receive clicks
+beneath the control center. It uses `wl_shm` plus Cairo directly and does not
+link GTK, Qt, WebKit, Electron, or an application shell.
 
 The drawer is a continuous, direct-manipulation control rather than an
 open/closed animation. While a finger is down, a single `revealed_px` value is
@@ -22,10 +24,12 @@ otherwise the drawer settles to the nearest stable state. A new touch cancels
 that short settle at its current rendered height, so the user can grab and
 reverse it midway. The only autonomous animation is this 90–220ms post-release
 settle, driven by Wayland frame callbacks. To keep the K230 compositor smooth,
-the complete drawer is rasterized once into a temporary 2.67 MiB Cairo image
-while it is being dragged or settled. The image is released immediately after
-the interaction; there is no idle timer, blur pass, screenshot cache, or
-persistent additional render target.
+the complete drawer is rasterized once during session start into a fixed 2.67
+MiB Cairo image. Each alternating `wl_shm` buffer records its own revealed
+height, so a drag uploads only the newly exposed or cleared horizontal band;
+slider motion redraws only its own card rectangle. This bounded cache removes
+the first-pull allocation and rasterisation stall without adding a timer, blur
+pass, screenshot cache, or resident polling worker.
 
 ## Design boundaries
 
@@ -89,15 +93,15 @@ For a target image or normal Linux development host with `wayland-client`,
 
 ## Memory contract
 
-The UI maintains no animation loop while idle and does not hold the large
-drawer buffers when closed. The direct-drag snapshot exists only while the
-finger is manipulating the drawer or while its post-release settle runs.
+The UI maintains no animation loop while idle. It deliberately retains the
+full-output SHM pair and one static Cairo panel while closed, so a pull gesture
+never allocates a full scene or waits for a layer-shell resize under the finger.
 
 | State | Maximum dedicated graphics allocation |
 |---|---:|
-| Edge trigger only, two 1232×32 32-bit wl_shm buffers | 0.30 MiB |
-| 1232×568 full-screen overlay, two 32-bit wl_shm buffers | 5.34 MiB |
-| UI-owned persistent graphics allocation while open | 5.34 MiB |
+| Closed transparent full-output layer: two 1232×568 32-bit wl_shm buffers | 5.34 MiB |
+| Persistent static ARGB32 Cairo panel cache | 2.67 MiB |
+| UI-owned persistent graphics allocation, closed or open | 8.01 MiB |
 
 See [docs/memory-budget.md](docs/memory-budget.md) and
 [docs/backend-protocol.md](docs/backend-protocol.md).

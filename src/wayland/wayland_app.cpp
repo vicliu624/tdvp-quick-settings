@@ -67,6 +67,34 @@ constexpr uint32_t kVersionSeat = 5;
 constexpr uint32_t kVersionLayerShell = 4;
 constexpr uint32_t kVersionOutput = 2;
 
+// This is intentionally opt-in: the control centre normally emits no
+// per-frame logging.  When diagnosing an interaction on target, the two
+// timestamps below let us separate CPU-side Cairo/Wayland submission from the
+// compositor's VGLite completion trace.
+[[nodiscard]] bool quick_settings_frame_timing_enabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("TDVP_QUICK_SETTINGS_FRAME_TIMING");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// An isolated acceptance session can ask the layer-shell client to submit a
+// bounded number of otherwise identical frames.  This measures the real
+// compositor/KMS callback cadence without requiring synthetic touch events or
+// enabling any behaviour in a production session.
+[[nodiscard]] uint32_t quick_settings_frame_benchmark_frames()
+{
+    static const uint32_t frames = [] {
+        const char* value = std::getenv("TDVP_QUICK_SETTINGS_FRAME_BENCHMARK");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0)
+            return 0U;
+        return 180U;
+    }();
+    return frames;
+}
+
 struct Buffer {
     wl_buffer* wl = nullptr;
     cairo_surface_t* cairo = nullptr;
@@ -74,6 +102,40 @@ struct Buffer {
     std::size_t length = 0;
     void* owner = nullptr;
     bool busy = false;
+    // Each wl_shm buffer is presented independently.  Keep its visual state
+    // so an alternating back buffer needs only the band the finger revealed
+    // since that particular buffer was last committed.
+    int revealed_height = 0;
+    std::array<int, 3> slider_values {{-1, -1, -1}};
+    std::array<bool, 3> slider_active {{false, false, false}};
+};
+
+struct Damage {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+
+    [[nodiscard]] bool empty() const { return width <= 0 || height <= 0; }
+
+    void include(const Rect& rect)
+    {
+        if (rect.width <= 0 || rect.height <= 0)
+            return;
+        if (empty()) {
+            x = rect.x;
+            y = rect.y;
+            width = rect.width;
+            height = rect.height;
+            return;
+        }
+        const int right = std::max(x + width, rect.x + rect.width);
+        const int bottom = std::max(y + height, rect.y + rect.height);
+        x = std::min(x, rect.x);
+        y = std::min(y, rect.y);
+        width = right - x;
+        height = bottom - y;
+    }
 };
 
 struct SliderWorkerRequest {
@@ -263,11 +325,14 @@ public:
             return 69;
         }
         open_ = open_on_start;
-        if (open_) {
+        benchmark_frames_remaining_ = quick_settings_frame_benchmark_frames();
+        // Fetch and rasterise the static control-centre board while the
+        // session starts.  Opening the drawer must never synchronously run
+        // nmcli or build a 1232x568 Cairo scene under a moving finger.
+        refresh_state();
+        refresh_wifi_networks();
+        if (open_)
             revealed_px_ = static_cast<float>(kFullDrawerHeight);
-            refresh_state();
-            refresh_wifi_networks();
-        }
         create_surface();
         while (running_ && wl_display_dispatch(display_) != -1)
             reap_slider_worker();
@@ -551,6 +616,7 @@ private:
         if (self->surface_width_ != configured_width || self->surface_height_ != configured_height ||
             self->width_ != buffer_extent.width || self->height_ != buffer_extent.height ||
             self->buffer_transform_ != buffer_transform) {
+            self->invalidate_animation_snapshot();
             self->destroy_buffers();
             self->surface_width_ = configured_width;
             self->surface_height_ = configured_height;
@@ -570,6 +636,8 @@ private:
                 return;
             }
         }
+        if (self->full_drawer_configured())
+            (void)self->create_animation_snapshot();
         if (self->open_ && self->full_drawer_configured() && self->opening_resize_in_progress_) {
             self->revealed_px_ = clamp_drawer_revealed(self->pending_revealed_px_,
                                                         static_cast<float>(self->height_));
@@ -781,7 +849,6 @@ private:
         buffer->busy = false;
         auto* self = static_cast<Impl*>(buffer->owner);
         if (self != nullptr && self->surface_ != nullptr && self->redraw_pending_) {
-            self->redraw_pending_ = false;
             self->redraw();
         }
     }
@@ -797,15 +864,20 @@ private:
         layer_surface_ = zwlr_layer_shell_v1_get_layer_surface(layer_shell_, surface_, output_, layer,
                                                                 "tdvp-quick-settings");
         zwlr_layer_surface_v1_add_listener(layer_surface_, &layer_listener(), this);
-        request_surface_geometry(open_);
+        // Keep a transparent full-output layer for the lifetime of the
+        // client.  Its input region, not its buffer size, is restricted to
+        // the edge trigger while closed.  That gives the first pull an
+        // already-allocated wl_shm pair and a pre-rendered static panel.
+        request_surface_geometry(true);
     }
 
     void request_surface_geometry(bool full_drawer)
     {
         if (layer_surface_ == nullptr || surface_ == nullptr)
             return;
-        full_surface_requested_ = full_drawer;
-        if (full_drawer) {
+        const bool use_full_surface = keep_full_surface_ || full_drawer;
+        full_surface_requested_ = use_full_surface;
+        if (use_full_surface) {
             zwlr_layer_surface_v1_set_anchor(
                 layer_surface_, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
@@ -828,6 +900,31 @@ private:
             layer_surface_, wifi_password_active() ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE
                                                    : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
         wl_surface_commit(surface_);
+    }
+
+    void update_surface_input_region()
+    {
+        if (surface_ == nullptr || compositor_ == nullptr || surface_width_ <= 0 ||
+            surface_height_ <= 0) {
+            return;
+        }
+        int input_height = kHiddenHeight;
+        if (open_ && full_drawer_configured()) {
+            // A drawer that has crossed the edge threshold is modal, just as
+            // Android's notification shade is.  Capturing the full output at
+            // that point prevents a fast finger from leaving a narrowly
+            // revealed input region and losing subsequent touch_motion events.
+            // The transparent lower area is only click-through while closed.
+            input_height = surface_height_;
+        }
+        input_height = std::max(0, std::min(surface_height_, input_height));
+        wl_region* region = wl_compositor_create_region(compositor_);
+        if (region == nullptr)
+            return;
+        if (input_height > 0)
+            wl_region_add(region, 0, 0, surface_width_, input_height);
+        wl_surface_set_input_region(surface_, region);
+        wl_region_destroy(region);
     }
 
     void destroy_surface()
@@ -869,6 +966,10 @@ private:
         }
         mapping_ = data;
         mapping_length_ = total_length;
+        // ftruncate-backed mappings are zero-filled, but make the invariant
+        // explicit: a buffer with revealed_height == 0 is transparent below
+        // the copied panel band even before it has ever been committed.
+        std::memset(mapping_, 0, mapping_length_);
         wl_shm_pool* pool = wl_shm_create_pool(shm_, descriptor, static_cast<int>(total_length));
         close(descriptor);
         if (pool == nullptr) {
@@ -883,6 +984,9 @@ private:
             buffer.data = static_cast<std::uint8_t*>(mapping_) + offset;
             buffer.length = frame_length;
             buffer.owner = this;
+            buffer.revealed_height = 0;
+            buffer.slider_values = {{-1, -1, -1}};
+            buffer.slider_active = {{false, false, false}};
             buffer.cairo = cairo_image_surface_create_for_data(buffer.data, CAIRO_FORMAT_ARGB32, width_, height_, stride);
             buffer.wl = wl_shm_pool_create_buffer(pool, static_cast<int>(offset), width_, height_, stride,
                                                    WL_SHM_FORMAT_ARGB8888);
@@ -913,6 +1017,9 @@ private:
             buffer.length = 0;
             buffer.owner = nullptr;
             buffer.busy = false;
+            buffer.revealed_height = 0;
+            buffer.slider_values = {{-1, -1, -1}};
+            buffer.slider_active = {{false, false, false}};
         }
         if (mapping_ != nullptr) {
             munmap(mapping_, mapping_length_);
@@ -963,7 +1070,6 @@ private:
             return;
         revealed_px_ = presented_revealed_px();
         drawer_settling_ = false;
-        destroy_animation_snapshot();
     }
 
     void sample_drawer_velocity(float current_y)
@@ -1026,18 +1132,25 @@ private:
         const float displacement = static_cast<float>(y) - gesture_origin_y_;
 
         if (drawer_gesture_ == DrawerGesture::Opening && !open_) {
-            // Keep the surface as the cheap 32px transparent edge until the
-            // finger has expressed an intentional pull.  The first expanded
-            // frame is nevertheless positioned at this exact displacement.
+            // The full transparent layer and its cached panel were prepared
+            // at session start.  Keep the input region at the 32px edge until
+            // the finger expresses an intentional pull, then render the
+            // exact displacement immediately without a layer-shell resize.
             if (displacement <= static_cast<float>(kGestureTouchSlop))
                 return true;
             open_ = true;
-            full_surface_requested_ = true;
-            opening_resize_in_progress_ = true;
             pending_revealed_px_ = clamp_drawer_revealed(revealed_on_down_px_ + displacement,
                                                          static_cast<float>(kFullDrawerHeight));
-            refresh_state();
-            refresh_wifi_networks();
+            if (full_drawer_configured()) {
+                revealed_px_ = clamp_drawer_revealed(pending_revealed_px_, drawer_extent_px());
+                drawer_drag_started_ = true;
+                redraw();
+                return true;
+            }
+            // Retain the resize path as a compatibility fallback for a
+            // compositor that rejects the initial full-output configure.
+            full_surface_requested_ = true;
+            opening_resize_in_progress_ = true;
             request_surface_geometry(true);
             return true;
         }
@@ -1116,11 +1229,18 @@ private:
         revealed_px_ = drawer_settle_target_ == DrawerSettleTarget::Expanded ? drawer_extent_px()
                                                                                : 0.0F;
         drawer_settling_ = false;
-        destroy_animation_snapshot();
         if (drawer_settle_target_ == DrawerSettleTarget::Collapsed) {
             open_ = false;
-            full_surface_requested_ = false;
             stop_slider_worker();
+            if (keep_full_surface_) {
+                // The root remains transparent and input-constrained to the
+                // top edge.  Keep the snapshot so the next pull has no cold
+                // Cairo scene build or layer-shell configure round trip.
+                redraw();
+                return;
+            }
+            invalidate_animation_snapshot();
+            full_surface_requested_ = false;
             request_surface_geometry(false);
             return;
         }
@@ -1146,18 +1266,37 @@ private:
         auto* self = static_cast<Impl*>(data);
         wl_callback_destroy(callback);
         self->frame_callback_ = nullptr;
-        if (!self->drawer_settling_)
-            return;
-        if (self->drawer_settle_progress() >= 1.0F) {
-            self->complete_drawer_settle();
-            return;
+        if (quick_settings_frame_timing_enabled() &&
+            self->frame_submit_time_.time_since_epoch().count() != 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - self->frame_submit_time_);
+            std::fprintf(stderr, "tdvp-quick-settings: frame=%llu presented=%.3f ms\n",
+                         static_cast<unsigned long long>(self->frame_sequence_),
+                         static_cast<double>(elapsed.count()) / 1000.0);
         }
-        self->redraw();
+        if (self->benchmark_frames_remaining_ > 0) {
+            --self->benchmark_frames_remaining_;
+            ++self->benchmark_tick_;
+            self->redraw_pending_ = true;
+        }
+        if (self->drawer_settling_) {
+            if (self->drawer_settle_progress() >= 1.0F) {
+                self->complete_drawer_settle();
+                return;
+            }
+            // The current settle position is sampled only after the compositor
+            // has presented the preceding commit.  This keeps the autonomous
+            // tail of the animation vblank-paced as well.
+            self->redraw_pending_ = true;
+        }
+        if (self->redraw_pending_)
+            self->redraw();
     }
 
     bool create_animation_snapshot()
     {
-        destroy_animation_snapshot();
+        if (animation_snapshot_ != nullptr)
+            return true;
         if (width_ <= 0 || height_ <= 0)
             return false;
         animation_snapshot_ = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width_, height_);
@@ -1172,7 +1311,13 @@ private:
             destroy_animation_snapshot();
             return false;
         }
+        // The cached image is the inactive, static panel. Slider value and
+        // active-thumb feedback are overlaid in their small card rectangles
+        // after the appropriate reveal band is copied into a wl_shm buffer.
+        const int saved_active_slider = active_slider_;
+        active_slider_ = -1;
         draw_open_contents(context);
+        active_slider_ = saved_active_slider;
         cairo_destroy(context);
         cairo_surface_flush(animation_snapshot_);
         return true;
@@ -1186,8 +1331,104 @@ private:
         }
     }
 
+    void invalidate_animation_snapshot()
+    {
+        destroy_animation_snapshot();
+        for (Buffer& buffer : buffers_) {
+            // The next commit of each back buffer will copy the new snapshot
+            // over the visible region.  Keeping the hidden region untouched
+            // is safe because it remains fully transparent to the compositor.
+            buffer.revealed_height = 0;
+            buffer.slider_values = {{-1, -1, -1}};
+            buffer.slider_active = {{false, false, false}};
+        }
+    }
+
+    void paint_snapshot_region(cairo_t* context, const Rect& region)
+    {
+        if (animation_snapshot_ == nullptr || region.width <= 0 || region.height <= 0)
+            return;
+        cairo_save(context);
+        cairo_rectangle(context, static_cast<double>(region.x), static_cast<double>(region.y),
+                        static_cast<double>(region.width), static_cast<double>(region.height));
+        cairo_clip(context);
+        cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_surface(context, animation_snapshot_, 0.0, 0.0);
+        cairo_paint(context);
+        cairo_restore(context);
+    }
+
+    void clear_region(cairo_t* context, const Rect& region)
+    {
+        if (region.width <= 0 || region.height <= 0)
+            return;
+        cairo_save(context);
+        cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(context, 0.0, 0.0, 0.0, 0.0);
+        cairo_rectangle(context, static_cast<double>(region.x), static_cast<double>(region.y),
+                        static_cast<double>(region.width), static_cast<double>(region.height));
+        cairo_fill(context);
+        cairo_restore(context);
+    }
+
+    [[nodiscard]] std::array<int, 3> current_slider_values() const
+    {
+        std::array<int, 3> values {{snapshot_.volume_percent, snapshot_.display_brightness_percent,
+                                    snapshot_.keyboard_backlight_percent}};
+        // The bounded acceptance benchmark deliberately changes one slider's
+        // visual state without touching any hardware provider.  It exercises
+        // the same narrow-damage path as a real drag while remaining strictly
+        // opt-in and harmless to production sessions.
+        if (benchmark_frames_remaining_ > 0)
+            values[0] = 20 + static_cast<int>(benchmark_tick_ % 61U);
+        return values;
+    }
+
+    void render_dynamic_sliders(cairo_t* context, Buffer& buffer, int revealed_height,
+                                Damage& damage)
+    {
+        if (revealed_height <= 0)
+            return;
+        const QuickSettingsModel model = derive_model(snapshot_);
+        const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
+        if (!layout.supported)
+            return;
+        const std::array<int, 3> values = current_slider_values();
+        static constexpr std::array<const char*, 3> titles {{"Volume", "Screen Brightness",
+                                                               "Keyboard Backlight"}};
+        for (std::size_t index = 0; index < layout.sliders.size(); ++index) {
+            const Rect& rect = layout.sliders[index];
+            if (rect.y + rect.height > revealed_height)
+                continue;
+            const bool active = active_slider_ == static_cast<int>(index) ||
+                                (benchmark_frames_remaining_ > 0 && index == 0U);
+            if (buffer.slider_values[index] == values[index] &&
+                buffer.slider_active[index] == active) {
+                continue;
+            }
+            paint_snapshot_region(context, rect);
+            draw_slider(context, rect, titles[index], values[index], active);
+            buffer.slider_values[index] = values[index];
+            buffer.slider_active[index] = active;
+            damage.include(rect);
+        }
+    }
+
     void redraw()
     {
+        if (surface_ == nullptr) {
+            redraw_pending_ = true;
+            return;
+        }
+        // wl_touch and wl_pointer motion can be delivered much faster than
+        // the 41.75 Hz panel.  Keep only the latest state while a frame is in
+        // flight; frame_done() performs the one permitted follow-up commit.
+        // This is also used by sliders, so hardware feedback remains current
+        // without creating an unbounded queue of Cairo/Wayland submissions.
+        if (frame_callback_ != nullptr) {
+            redraw_pending_ = true;
+            return;
+        }
         Buffer* buffer = nullptr;
         for (Buffer& candidate : buffers_) {
             if (!candidate.busy) {
@@ -1201,51 +1442,80 @@ private:
         }
         redraw_pending_ = false;
 
+        const bool timing_enabled = quick_settings_frame_timing_enabled();
+        const auto render_started = std::chrono::steady_clock::now();
         cairo_t* context = cairo_create(buffer->cairo);
+        Damage damage;
         if (open_ && full_drawer_configured()) {
-            draw_open(context);
+            damage = draw_open(context, *buffer);
         } else {
             cairo_save(context);
             cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
             cairo_set_source_rgba(context, 0.0, 0.0, 0.0, 0.0);
             cairo_paint(context);
             cairo_restore(context);
+            buffer->revealed_height = 0;
+            buffer->slider_values = {{-1, -1, -1}};
+            buffer->slider_active = {{false, false, false}};
+            damage.include(Rect {0, 0, width_, height_});
         }
         cairo_destroy(context);
-        cairo_surface_flush(buffer->cairo);
-        if (drawer_settling_ && frame_callback_ == nullptr) {
-            frame_callback_ = wl_surface_frame(surface_);
-            wl_callback_add_listener(frame_callback_, &frame_listener(), this);
+        if (damage.empty()) {
+            // No visual state changed.  Avoid attaching an identical full
+            // buffer: doing so would force wlroots/VGLite to re-upload and
+            // composite the entire 1232x568 surface for no visible result.
+            return;
         }
+        cairo_surface_flush(buffer->cairo);
+        // Request a callback for every committed frame, not only the release
+        // settle animation.  Raw input now coalesces behind this callback.
+        frame_callback_ = wl_surface_frame(surface_);
+        if (frame_callback_ != nullptr)
+            wl_callback_add_listener(frame_callback_, &frame_listener(), this);
         wl_surface_attach(surface_, buffer->wl, 0, 0);
-        wl_surface_damage_buffer(surface_, 0, 0, width_, height_);
+        wl_surface_damage_buffer(surface_, damage.x, damage.y, damage.width, damage.height);
+        update_surface_input_region();
         wl_surface_commit(surface_);
         buffer->busy = true;
+        frame_submit_time_ = std::chrono::steady_clock::now();
+        ++frame_sequence_;
+        if (timing_enabled) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                frame_submit_time_ - render_started);
+            std::fprintf(stderr,
+                         "tdvp-quick-settings: frame=%llu render-submit=%.3f ms %dx%d damage=%dx%d+%d+%d\n",
+                         static_cast<unsigned long long>(frame_sequence_),
+                         static_cast<double>(elapsed.count()) / 1000.0, width_, height_,
+                         damage.width, damage.height, damage.x, damage.y);
+        }
     }
 
-    void draw_open(cairo_t* context)
+    Damage draw_open(cairo_t* context, Buffer& buffer)
     {
-        cairo_save(context);
-        cairo_set_operator(context, CAIRO_OPERATOR_SOURCE);
-        cairo_set_source_rgba(context, 0.0, 0.0, 0.0, 0.0);
-        cairo_paint(context);
-        cairo_restore(context);
+        Damage damage;
+        if (!create_animation_snapshot())
+            return damage;
 
         // Android's shade exposes a progressively larger portion of a fixed
-        // panel from the display edge.  Cropping the content to `revealed_px`
-        // means its bottom edge stays exactly under the finger; translating a
-        // full-height texture would instead reveal the bottom rows first.
-        const double revealed = static_cast<double>(presented_revealed_px());
-        cairo_save(context);
-        cairo_rectangle(context, 0.0, 0.0, static_cast<double>(width_), revealed);
-        cairo_clip(context);
-        if (animation_snapshot_ != nullptr) {
-            cairo_set_source_surface(context, animation_snapshot_, 0.0, 0.0);
-            cairo_paint(context);
-        } else {
-            draw_open_contents(context);
+        // panel from the display edge.  Cache the whole static panel once and
+        // copy only the horizontal strip added or removed since *this* back
+        // buffer's previous presentation.  The VGLite wlroots renderer then
+        // receives the same narrow damage rectangle instead of a full screen.
+        const int revealed = std::max(0, std::min(height_,
+            static_cast<int>(std::ceil(presented_revealed_px()))));
+        const int previous = std::max(0, std::min(height_, buffer.revealed_height));
+        if (revealed > previous) {
+            const Rect band {0, previous, width_, revealed - previous};
+            paint_snapshot_region(context, band);
+            damage.include(band);
+        } else if (revealed < previous) {
+            const Rect band {0, revealed, width_, previous - revealed};
+            clear_region(context, band);
+            damage.include(band);
         }
-        cairo_restore(context);
+        buffer.revealed_height = revealed;
+        render_dynamic_sliders(context, buffer, revealed, damage);
+        return damage;
     }
 
     void draw_open_contents(cairo_t* context)
@@ -1388,14 +1658,18 @@ private:
         } else {
             message_ = reply.error;
         }
+        invalidate_animation_snapshot();
     }
 
     void refresh_wifi_networks()
     {
         wifi_scan_ = {};
         if (!snapshot_.wifi_enabled)
-            return;
-        wifi_scan_ = scan_wifi_networks();
+            invalidate_animation_snapshot();
+        else {
+            wifi_scan_ = scan_wifi_networks();
+            invalidate_animation_snapshot();
+        }
         if (wifi_scan_.ok)
             (void)request_wifi_rescan();
     }
@@ -1636,6 +1910,7 @@ private:
         const bool target_enabled = !snapshot_.wifi_enabled;
         if (!request_wifi_radio(target_enabled)) {
             wifi_feedback_ = "Unavailable";
+            invalidate_animation_snapshot();
             redraw();
             return;
         }
@@ -1648,6 +1923,7 @@ private:
         wifi_scan_ = {};
         if (target_enabled)
             (void)request_wifi_rescan();
+        invalidate_animation_snapshot();
         redraw();
     }
 
@@ -1657,6 +1933,7 @@ private:
         const ProviderReply reply = provider_.request("SET speaker-route " + target);
         if (!reply.ok) {
             audio_feedback_ = "Unavailable";
+            invalidate_animation_snapshot();
             redraw();
             return;
         }
@@ -1665,11 +1942,13 @@ private:
         // returns. Do not claim a switch until that readback agrees.
         if (snapshot_.audio_output != target) {
             audio_feedback_ = "Unavailable";
+            invalidate_animation_snapshot();
             redraw();
             return;
         }
         audio_feedback_ = target == "external" ? "Speaker" : "Internal";
         message_.clear();
+        invalidate_animation_snapshot();
         redraw();
     }
 
@@ -1747,6 +2026,7 @@ private:
         } else {
             message_ = reply.error;
         }
+        invalidate_animation_snapshot();
         redraw();
     }
 
@@ -1958,6 +2238,10 @@ private:
     float vertical_velocity_px_per_second_ = 0.0F;
     float drawer_settle_start_px_ = 0.0F;
     int drawer_settle_duration_ms_ = 0;
+    // Two SHM buffers plus one cached ARGB panel use about 8.4 MiB at
+    // 1232x568.  That bounded allocation eliminates a >400 ms first-pull
+    // stall and is retained instead of repeatedly allocating during gestures.
+    bool keep_full_surface_ = true;
     bool full_surface_requested_ = false;
     bool opening_resize_in_progress_ = false;
     bool drawer_drag_started_ = false;
@@ -1970,6 +2254,7 @@ private:
     std::chrono::steady_clock::time_point last_touch_event_ {};
     std::chrono::steady_clock::time_point last_pointer_press_ {};
     std::chrono::steady_clock::time_point last_slider_enqueue_ {};
+    std::chrono::steady_clock::time_point frame_submit_time_ {};
     std::array<int, 3> last_slider_enqueued_ {{-1, -1, -1}};
     pid_t slider_worker_pid_ = -1;
     int slider_worker_descriptor_ = -1;
@@ -1978,6 +2263,9 @@ private:
     bool left_shift_ = false;
     bool right_shift_ = false;
     bool redraw_pending_ = false;
+    uint64_t frame_sequence_ = 0;
+    uint32_t benchmark_frames_remaining_ = 0;
+    uint32_t benchmark_tick_ = 0;
     bool open_ = false;
     bool running_ = true;
     ProviderClient provider_;
