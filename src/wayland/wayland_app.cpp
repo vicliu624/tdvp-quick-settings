@@ -4,6 +4,7 @@
 #include "core/drawer.hpp"
 #include "core/layout.hpp"
 #include "core/orientation.hpp"
+#include "core/session_power.hpp"
 #include "core/state.hpp"
 #include "wayland/provider_client.hpp"
 #include "wayland/wifi_nmcli.hpp"
@@ -30,6 +31,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
@@ -338,6 +340,31 @@ int slider_percent(const Rect& rect, int pointer_x)
     if (width <= 0)
         return 0;
     return clamp_percent((pointer_x - start) * 100 / width);
+}
+
+[[nodiscard]] Rect session_power_dialog_rect()
+{
+    return Rect {300, 112, 632, 272};
+}
+
+[[nodiscard]] Rect session_power_lock_timeout_rect()
+{
+    return Rect {332, 164, 568, 56};
+}
+
+[[nodiscard]] Rect session_power_blank_timeout_rect()
+{
+    return Rect {332, 232, 568, 56};
+}
+
+[[nodiscard]] Rect session_power_lock_now_rect()
+{
+    return Rect {332, 304, 272, 48};
+}
+
+[[nodiscard]] Rect session_power_done_rect()
+{
+    return Rect {628, 304, 272, 48};
 }
 
 void launch_session_process(const std::vector<std::string>& arguments)
@@ -1316,6 +1343,7 @@ private:
         drawer_settling_ = false;
         if (drawer_settle_target_ == DrawerSettleTarget::Collapsed) {
             open_ = false;
+            session_power_settings_open_ = false;
             stop_slider_worker();
             if (keep_full_surface_) {
                 // The root remains transparent and input-constrained to the
@@ -1646,7 +1674,7 @@ private:
         draw_keyboard_backlight_presets(context, layout.sliders[2],
                                         snapshot_.keyboard_backlight_percent);
         draw_card(context, layout.secondary_actions[0], snapshot_.muted ? "Unmute" : "Mute", "Audio control");
-        draw_card(context, layout.secondary_actions[1], "Settings", "System settings");
+        draw_card(context, layout.secondary_actions[1], "Display & Lock", "Screen timeout settings");
         draw_card(context, layout.system_actions[0], "Lock", "Lock session");
         draw_card(context, layout.system_actions[1], "Restart", "Restart system");
         draw_card(context, layout.system_actions[2], "Power Off", "Shut down");
@@ -1681,7 +1709,9 @@ private:
         }
         draw_card(context, layout.network_settings, "Refresh networks", "Use NetworkManager scan");
 
-        if (pending_confirmation_ != Confirmation::None)
+        if (session_power_settings_open_)
+            draw_session_power_settings(context);
+        else if (pending_confirmation_ != Confirmation::None)
             draw_confirmation(context);
         else if (wifi_password_active())
             draw_wifi_password(context);
@@ -1732,6 +1762,110 @@ private:
         const Rect connect {632, 346, 256, 48};
         draw_card(context, cancel, "Cancel", "Esc");
         draw_card(context, connect, "Connect", "Enter");
+    }
+
+    void draw_session_power_settings(cairo_t* context)
+    {
+        cairo_set_source_rgba(context, 0.10, 0.10, 0.09, 0.46);
+        cairo_rectangle(context, 0.0, 0.0, static_cast<double>(width_), static_cast<double>(height_));
+        cairo_fill(context);
+
+        const Rect dialog = session_power_dialog_rect();
+        draw_rounded_rect(context, dialog, 12.0);
+        cairo_set_source_rgba(context, 0.12, 0.12, 0.10, 0.97);
+        cairo_fill(context);
+        cairo_set_source_rgb(context, 1.0, 0.98, 0.94);
+        draw_text(context, 332.0, 146.0, 22.0, "Display & Lock", true);
+
+        const std::string lock_detail = format_session_timeout(session_power_policy_.lock_after_seconds) +
+                                        "  Tap to change";
+        std::string blank_detail;
+        if (session_power_policy_.blank_after_seconds == 0) {
+            blank_detail = "Off  Tap to change";
+        } else if (session_power_policy_.lock_after_seconds == 0) {
+            blank_detail = format_session_timeout(session_power_policy_.blank_after_seconds) +
+                           " after lock (auto lock is off)";
+        } else {
+            blank_detail = format_session_timeout(session_power_policy_.blank_after_seconds) +
+                           " after lock  Tap to change";
+        }
+        draw_card(context, session_power_lock_timeout_rect(), "Auto lock", lock_detail.c_str());
+        draw_card(context, session_power_blank_timeout_rect(), "Screen off", blank_detail.c_str());
+        draw_card(context, session_power_lock_now_rect(), "Lock now", "Require password");
+        draw_card(context, session_power_done_rect(), "Done", "Keep these settings");
+    }
+
+    void refresh_session_power_policy()
+    {
+        const char* runtime_directory = std::getenv("XDG_RUNTIME_DIR");
+        if (runtime_directory == nullptr || runtime_directory[0] == '\0')
+            return;
+        const std::string state_path =
+            std::string(runtime_directory) + "/tdvp-session-power/state.env";
+        std::ifstream state_file(state_path);
+        if (!state_file.is_open())
+            return;
+        std::string state;
+        std::string line;
+        while (std::getline(state_file, line)) {
+            state += line;
+            state += '\n';
+        }
+        session_power_policy_ = parse_session_power_state(state);
+    }
+
+    void update_session_power_policy(bool lock_timeout)
+    {
+        if (lock_timeout) {
+            session_power_policy_ = next_lock_after(session_power_policy_);
+            launch_session_process({"/usr/local/bin/tdvp-session-powerctl", "set", "lock-after",
+                                    std::to_string(session_power_policy_.lock_after_seconds)});
+            message_ = "Auto lock: " + format_session_timeout(session_power_policy_.lock_after_seconds);
+        } else {
+            session_power_policy_ = next_blank_after(session_power_policy_);
+            launch_session_process({"/usr/local/bin/tdvp-session-powerctl", "set", "blank-after",
+                                    std::to_string(session_power_policy_.blank_after_seconds)});
+            message_ = "Screen off: " + format_session_timeout(session_power_policy_.blank_after_seconds);
+        }
+        invalidate_animation_snapshot();
+        redraw();
+    }
+
+    void lock_session_now()
+    {
+        if (access("/usr/local/bin/tdvp-session-lock", X_OK) != 0) {
+            message_ = "Authenticated screen locking is not installed";
+            redraw();
+            return;
+        }
+        launch_session_process({"/usr/local/bin/tdvp-session-lock"});
+        session_power_settings_open_ = false;
+        open_ = false;
+        revealed_px_ = 0.0F;
+        full_surface_requested_ = false;
+        pending_confirmation_ = Confirmation::None;
+        request_surface_geometry(false);
+    }
+
+    void handle_session_power_settings_press(int pointer_x, int pointer_y)
+    {
+        if (session_power_lock_timeout_rect().contains(pointer_x, pointer_y)) {
+            update_session_power_policy(true);
+            return;
+        }
+        if (session_power_blank_timeout_rect().contains(pointer_x, pointer_y)) {
+            update_session_power_policy(false);
+            return;
+        }
+        if (session_power_lock_now_rect().contains(pointer_x, pointer_y)) {
+            lock_session_now();
+            return;
+        }
+        if (session_power_done_rect().contains(pointer_x, pointer_y)) {
+            session_power_settings_open_ = false;
+            invalidate_animation_snapshot();
+            redraw();
+        }
     }
 
     void refresh_state()
@@ -2191,6 +2325,10 @@ private:
     {
         if (pointer_y < kStatusHeight)
             return;
+        if (session_power_settings_open_) {
+            handle_session_power_settings_press(pointer_x, pointer_y);
+            return;
+        }
         if (pending_confirmation_ != Confirmation::None) {
             const Rect cancel {368, 290, 208, 48};
             const Rect confirm {656, 290, 208, 48};
@@ -2246,18 +2384,14 @@ private:
             execute_provider("SET speaker-mute toggle");
             return;
         } else if (layout.secondary_actions[1].contains(pointer_x, pointer_y)) {
-            launch_session_process({"/usr/bin/pcmanfm", "--desktop-pref"});
+            refresh_session_power_policy();
+            session_power_settings_open_ = true;
+            invalidate_animation_snapshot();
+            redraw();
+            return;
         } else if (layout.system_actions[0].contains(pointer_x, pointer_y)) {
-            if (access("/usr/bin/swaylock", X_OK) == 0) {
-                launch_session_process({"/usr/bin/swaylock", "-f", "-c", "1f1e1b"});
-                open_ = false;
-                revealed_px_ = 0.0F;
-                full_surface_requested_ = false;
-                pending_confirmation_ = Confirmation::None;
-                request_surface_geometry(false);
-                return;
-            }
-            message_ = "Authenticated screen locking is not installed";
+            lock_session_now();
+            return;
         } else if (layout.system_actions[1].contains(pointer_x, pointer_y)) {
             execute_provider("SYSTEM reboot");
             return;
@@ -2387,6 +2521,8 @@ private:
     std::string message_;
     std::string wifi_feedback_;
     std::string audio_feedback_;
+    SessionPowerPolicy session_power_policy_;
+    bool session_power_settings_open_ = false;
     int selected_network_index_ = -1;
     std::string wifi_passphrase_;
     RequestedAction pending_action_ = RequestedAction::EnableLora;

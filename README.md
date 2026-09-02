@@ -40,11 +40,23 @@ pass, screenshot cache, or resident polling worker.
   route policy.
 * **Existing desktop:** Labwc, PCManFM, and wf-panel-pi remain independent.
   Removing this package removes only the extra Quick Settings interaction.
+* **Session security and display power:** the image-owned user session runs
+  `swayidle`, PAM-backed `swaylock`, and `wlopm`. Quick Settings only presents
+  the touch UI for the per-user timeout policy and requests an immediate lock;
+  it neither embeds authentication nor turns a Wayland output off directly.
 
 There is deliberately no fallback-mode controller, watchdog, panel restart
 loop, or special recovery desktop in this project. The established Linux
 desktop components already provide those independent interaction paths; Quick
 Settings only adds the top-edge touch gesture and its overlay.
+
+The **Display & Lock** card opens a touch-sized modal setting panel. Tapping
+**Auto lock** cycles 1, 2, 5, and 10 minutes before Off; **Screen off** cycles
+15, 30, and 60 seconds after locking before Off. The policy is persisted in
+the authenticated user's XDG configuration directory and takes effect by
+restarting that user's `swayidle` process. **Lock now** calls the image's
+single-instance lock wrapper, so it stays PAM-authenticated even if the button
+is tapped repeatedly.
 
 Wi-Fi actions are executed synchronously through NetworkManager: a card only
 changes its local `On`/`Off` detail after `nmcli` confirms the requested radio

@@ -2,6 +2,7 @@
 #include "core/drawer.hpp"
 #include "core/layout.hpp"
 #include "core/orientation.hpp"
+#include "core/session_power.hpp"
 #include "core/status.hpp"
 
 #include <cstdlib>
@@ -210,6 +211,24 @@ void test_rotated_k230_surface_uses_landscape_buffer_and_input_coordinates()
            SurfaceTransform::Rotate270);
 }
 
+void test_session_power_policy_is_bounded_and_touch_cycleable()
+{
+    const auto parsed = tdvp::quick_settings::parse_session_power_state(
+        "lock_after_seconds=120\n"
+        "blank_after_seconds=60\n"
+        "ignored=value\n"
+        "lock_after_seconds=not-a-number\n");
+    EXPECT(parsed.lock_after_seconds == 120);
+    EXPECT(parsed.blank_after_seconds == 60);
+
+    const auto next_lock = tdvp::quick_settings::next_lock_after(parsed);
+    EXPECT(next_lock.lock_after_seconds == 300);
+    const auto next_blank = tdvp::quick_settings::next_blank_after(parsed);
+    EXPECT(next_blank.blank_after_seconds == 0);
+    EXPECT(tdvp::quick_settings::format_session_timeout(300) == "5 min");
+    EXPECT(tdvp::quick_settings::format_session_timeout(0) == "Off");
+}
+
 }  // namespace
 
 int main()
@@ -227,6 +246,7 @@ int main()
     test_drawer_release_uses_velocity_then_nearest_state();
     test_drawer_settle_starts_without_a_jump();
     test_rotated_k230_surface_uses_landscape_buffer_and_input_coordinates();
+    test_session_power_policy_is_bounded_and_touch_cycleable();
     if (failures == 0) {
         std::cout << "all tdvp-quick-settings core tests passed\n";
         return EXIT_SUCCESS;
