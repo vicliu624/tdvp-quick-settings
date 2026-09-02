@@ -145,6 +145,15 @@ struct SliderWorkerRequest {
     int percent = 0;
 };
 
+// Keep the worker IPC trivially copyable. ProviderReply owns strings and must
+// never be copied across forked-process memory as a C++ object.
+struct SliderWorkerResponse {
+    int slider = -1;
+    int percent = 0;
+    bool ok = false;
+    std::array<char, 128> error {};
+};
+
 int create_anonymous_file(std::size_t size)
 {
     char path[] = "/tmp/tdvp-quick-settings-XXXXXX";
@@ -2026,8 +2035,35 @@ private:
             const char* command_name = slider_command_name(newest.slider);
             if (command_name != nullptr) {
                 ProviderClient provider;
-                (void)provider.request("SET " + std::string(command_name) + " " +
-                                       std::to_string(newest.percent));
+                const ProviderReply reply = provider.request(
+                    "SET " + std::string(command_name) + " " + std::to_string(newest.percent));
+                SliderWorkerResponse response;
+                response.slider = newest.slider;
+                response.ok = reply.ok;
+                response.percent = newest.percent;
+                if (reply.ok) {
+                    switch (newest.slider) {
+                    case 0:
+                        response.percent = reply.snapshot.volume_percent;
+                        break;
+                    case 1:
+                        response.percent = reply.snapshot.display_brightness_percent;
+                        break;
+                    case 2:
+                        response.percent = reply.snapshot.keyboard_backlight_percent;
+                        break;
+                    default:
+                        break;
+                    }
+                } else {
+                    std::snprintf(response.error.data(), response.error.size(), "%s",
+                                  reply.error.c_str());
+                }
+                // The parent end is non-blocking. A subsequent response
+                // supersedes an older drag position, so dropping a full
+                // response is safe: the next accepted provider state is
+                // still authoritative.
+                (void)send(descriptor, &response, sizeof(response), MSG_DONTWAIT | MSG_NOSIGNAL);
             }
         }
         close(descriptor);
@@ -2036,6 +2072,32 @@ private:
 
     void reap_slider_worker()
     {
+        // The worker returns hardware-provider results through the same
+        // SOCK_SEQPACKET pair. Do not optimistically mutate snapshot_ at drag
+        // time: this is the only point where a slider becomes committed UI
+        // state, and only after the privileged service has accepted it.
+        if (slider_worker_descriptor_ >= 0) {
+            for (;;) {
+                SliderWorkerResponse response;
+                const ssize_t received = recv(slider_worker_descriptor_, &response, sizeof(response),
+                                              MSG_DONTWAIT);
+                if (received == static_cast<ssize_t>(sizeof(response))) {
+                    if (response.ok) {
+                        set_slider_snapshot_value(response.slider, response.percent);
+                        message_.clear();
+                    } else {
+                        message_ = response.error[0] != '\0'
+                                       ? std::string(response.error.data())
+                                       : "hardware provider rejected the slider update";
+                    }
+                    redraw();
+                    continue;
+                }
+                if (received < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+        }
         if (slider_worker_pid_ <= 0)
             return;
         int status = 0;
@@ -2131,7 +2193,6 @@ private:
         }
         const std::size_t index = static_cast<std::size_t>(active_slider_);
         const int percent = slider_percent(layout.sliders[index], pointer_x);
-        set_slider_snapshot_value(active_slider_, percent);
 
         const auto now = std::chrono::steady_clock::now();
         if (last_slider_enqueued_[index] == percent ||
@@ -2142,6 +2203,8 @@ private:
         if (queue_slider_value(active_slider_, percent)) {
             last_slider_enqueued_[index] = percent;
             last_slider_enqueue_ = now;
+        } else {
+            message_ = "hardware provider is unavailable";
         }
         redraw();
     }
