@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <string>
 
 namespace tdvp::quick_settings {
@@ -32,11 +34,26 @@ enum class AuxiliaryTile {
     OnScreenKeyboard,
 };
 
+// The first row is capability-driven: a card exists only when it can perform
+// a real action on the current board.  This keeps optional radios from
+// becoming decorative, non-functional controls.
+enum class PrimaryTile {
+    Wifi,
+    Bluetooth,
+    AudioOutput,
+    Lora,
+    Gps,
+    OnScreenKeyboard,
+};
+
 struct HardwareSnapshot {
     bool keyboard_attached = false;
     bool wifi_available = false;
     bool wifi_enabled = false;
     bool wifi_connected = false;
+    bool bluetooth_available = false;
+    bool bluetooth_control_available = false;
+    bool bluetooth_enabled = false;
     bool lora_available = false;
     bool lora_enabled = false;
     LteSkuState lte_sku = LteSkuState::Detached;
@@ -56,6 +73,9 @@ struct QuickSettingsModel {
     bool show_lora = false;
     bool show_gps = false;
     bool gps_interactive = false;
+    bool show_bluetooth = false;
+    std::array<PrimaryTile, 5> primary_tiles {};
+    std::size_t primary_tile_count = 0;
     AuxiliaryTile fourth_primary_tile = AuxiliaryTile::OnScreenKeyboard;
     std::string gps_detail;
     std::string lora_detail;

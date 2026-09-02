@@ -27,7 +27,8 @@ struct QuickSettingsLayout {
     bool requires_vertical_scroll = false;
     Rect status_bar;
     Rect drawer;
-    std::array<Rect, 4> primary_cards {};
+    std::array<Rect, 5> primary_cards {};
+    std::size_t primary_card_count = 0;
     std::array<Rect, 3> sliders {};
     std::array<Rect, 2> secondary_actions {};
     std::array<Rect, 3> system_actions {};
@@ -42,4 +43,3 @@ struct QuickSettingsLayout {
 [[nodiscard]] bool valid_layout(const QuickSettingsLayout& layout, Extent display);
 
 }  // namespace tdvp::quick_settings
-

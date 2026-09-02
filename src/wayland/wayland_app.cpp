@@ -1634,6 +1634,46 @@ private:
         return damage;
     }
 
+    void draw_primary_tile(cairo_t* context, const Rect& card, const QuickSettingsModel& model,
+                           PrimaryTile tile)
+    {
+        switch (tile) {
+        case PrimaryTile::Wifi: {
+            const std::string detail = !wifi_feedback_.empty()
+                                           ? wifi_feedback_
+                                           : (snapshot_.wifi_connected ? "Connected" :
+                                              (snapshot_.wifi_enabled ? "On" : "Off"));
+            draw_card(context, card, "Wi-Fi", detail.c_str());
+            return;
+        }
+        case PrimaryTile::Bluetooth: {
+            const std::string detail = !bluetooth_feedback_.empty()
+                                           ? bluetooth_feedback_
+                                           : (snapshot_.bluetooth_enabled ? "On" : "Off");
+            draw_card(context, card, "Bluetooth", detail.c_str());
+            return;
+        }
+        case PrimaryTile::AudioOutput: {
+            const std::string detail = !audio_feedback_.empty()
+                                           ? audio_feedback_
+                                           : (snapshot_.audio_output == "external" ? "Speaker" :
+                                              (snapshot_.audio_output == "internal" ? "Internal" :
+                                                                                       "Unavailable"));
+            draw_card(context, card, "Audio Output", detail.c_str());
+            return;
+        }
+        case PrimaryTile::Lora:
+            draw_card(context, card, "LoRa", snapshot_.lora_enabled ? "On" : "Off");
+            return;
+        case PrimaryTile::Gps:
+            draw_card(context, card, "GPS", model.gps_detail.c_str());
+            return;
+        case PrimaryTile::OnScreenKeyboard:
+            draw_card(context, card, "Keyboard", "Show on-screen keyboard");
+            return;
+        }
+    }
+
     void draw_open_contents(cairo_t* context)
     {
         cairo_set_source_rgb(context, 0.965, 0.945, 0.90);
@@ -1649,23 +1689,8 @@ private:
         const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
         if (!layout.supported)
             return;
-        const std::string wifi_detail = !wifi_feedback_.empty()
-                                            ? wifi_feedback_
-                                            : (snapshot_.wifi_connected ? "Connected" :
-                                               (snapshot_.wifi_enabled ? "On" : "Off"));
-        const std::string audio_detail = !audio_feedback_.empty()
-                                             ? audio_feedback_
-                                             : (snapshot_.audio_output == "external" ? "Speaker" :
-                                                (snapshot_.audio_output == "internal" ? "Internal" :
-                                                                                         "Unavailable"));
-        const char* lora_detail = snapshot_.lora_enabled ? "On" : "Off";
-        const char* fourth_title = model.fourth_primary_tile == AuxiliaryTile::Gps ? "GPS" : "On-screen Keyboard";
-        const char* fourth_detail = model.fourth_primary_tile == AuxiliaryTile::Gps
-                                         ? model.gps_detail.c_str() : "Show keyboard";
-        draw_card(context, layout.primary_cards[0], "Wi-Fi", wifi_detail.c_str());
-        draw_card(context, layout.primary_cards[1], "Audio Output", audio_detail.c_str());
-        draw_card(context, layout.primary_cards[2], "LoRa", lora_detail);
-        draw_card(context, layout.primary_cards[3], fourth_title, fourth_detail);
+        for (std::size_t index = 0; index < layout.primary_card_count; ++index)
+            draw_primary_tile(context, layout.primary_cards[index], model, model.primary_tiles[index]);
         draw_slider(context, layout.sliders[0], "Volume", snapshot_.volume_percent,
                     active_slider_ == 0);
         draw_slider(context, layout.sliders[1], "Screen Brightness",
@@ -2150,6 +2175,31 @@ private:
         redraw();
     }
 
+    void toggle_bluetooth()
+    {
+        if (!snapshot_.bluetooth_available || !snapshot_.bluetooth_control_available) {
+            bluetooth_feedback_ = "Unavailable";
+            invalidate_animation_snapshot();
+            redraw();
+            return;
+        }
+        const bool target_enabled = !snapshot_.bluetooth_enabled;
+        const ProviderReply reply = provider_.request(
+            std::string("SET bluetooth-power ") + (target_enabled ? "on" : "off"));
+        if (!reply.ok || !reply.snapshot.bluetooth_control_available ||
+            reply.snapshot.bluetooth_enabled != target_enabled) {
+            bluetooth_feedback_ = "Unavailable";
+            invalidate_animation_snapshot();
+            redraw();
+            return;
+        }
+        snapshot_ = reply.snapshot;
+        bluetooth_feedback_ = target_enabled ? "On" : "Off";
+        message_.clear();
+        invalidate_animation_snapshot();
+        redraw();
+    }
+
     void toggle_audio_output()
     {
         const std::string target = snapshot_.audio_output == "external" ? "internal" : "external";
@@ -2321,6 +2371,36 @@ private:
         redraw();
     }
 
+    void activate_primary_tile(PrimaryTile tile)
+    {
+        switch (tile) {
+        case PrimaryTile::Wifi:
+            toggle_wifi();
+            return;
+        case PrimaryTile::Bluetooth:
+            toggle_bluetooth();
+            return;
+        case PrimaryTile::AudioOutput:
+            toggle_audio_output();
+            return;
+        case PrimaryTile::Lora:
+            execute_radio_action(snapshot_.lora_enabled ? RequestedAction::DisableLora
+                                                        : RequestedAction::EnableLora,
+                                 false);
+            return;
+        case PrimaryTile::Gps:
+            execute_radio_action(snapshot_.gps_enabled ? RequestedAction::DisableGps
+                                                       : RequestedAction::EnableGps,
+                                 false);
+            return;
+        case PrimaryTile::OnScreenKeyboard:
+            launch_session_process({"/usr/local/bin/vpl-osk"});
+            message_ = "On-screen keyboard toggled";
+            redraw();
+            return;
+        }
+    }
+
     void handle_press(int pointer_x, int pointer_y)
     {
         if (pointer_y < kStatusHeight)
@@ -2353,23 +2433,13 @@ private:
         const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
         if (!layout.supported)
             return;
-        if (layout.primary_cards[0].contains(pointer_x, pointer_y)) {
-            toggle_wifi();
-            return;
-        } else if (layout.primary_cards[1].contains(pointer_x, pointer_y)) {
-            toggle_audio_output();
-            return;
-        } else if (layout.primary_cards[2].contains(pointer_x, pointer_y)) {
-            execute_radio_action(snapshot_.lora_enabled ? RequestedAction::DisableLora : RequestedAction::EnableLora, false);
-            return;
-        } else if (layout.primary_cards[3].contains(pointer_x, pointer_y)) {
-            if (model.fourth_primary_tile == AuxiliaryTile::Gps) {
-                execute_radio_action(snapshot_.gps_enabled ? RequestedAction::DisableGps : RequestedAction::EnableGps, false);
+        for (std::size_t index = 0; index < layout.primary_card_count; ++index) {
+            if (layout.primary_cards[index].contains(pointer_x, pointer_y)) {
+                activate_primary_tile(model.primary_tiles[index]);
                 return;
             }
-            launch_session_process({"/usr/local/bin/vpl-osk"});
-            message_ = "On-screen keyboard toggled";
-        } else if (layout.sliders[0].contains(pointer_x, pointer_y)) {
+        }
+        if (layout.sliders[0].contains(pointer_x, pointer_y)) {
             const int percent = slider_percent(layout.sliders[0], pointer_x);
             execute_provider("SET speaker-volume " + std::to_string(percent));
             return;
@@ -2520,6 +2590,7 @@ private:
     WifiScanResult wifi_scan_;
     std::string message_;
     std::string wifi_feedback_;
+    std::string bluetooth_feedback_;
     std::string audio_feedback_;
     SessionPowerPolicy session_power_policy_;
     bool session_power_settings_open_ = false;

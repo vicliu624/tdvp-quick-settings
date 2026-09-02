@@ -22,6 +22,9 @@ response: result=ok
           dock_nrf9151_sku_state=lte-present
           gps_available=1
           gps_state=fix
+          bluetooth_available=1
+          bluetooth_control_available=1
+          bluetooth_enabled=0
           lora_available=1
           lora_enabled=0
           radio_profile=nrf9151
@@ -38,6 +41,7 @@ SET keyboard-backlight 0..100
 SET speaker-route external|internal
 SET speaker-volume 0..100
 SET speaker-mute mute|unmute|toggle
+SET bluetooth-power on|off
 SET lora-power on|off
 SET gnss-power on|off
 SET radio-profile lora|nrf9151

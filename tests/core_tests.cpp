@@ -20,6 +20,7 @@ using tdvp::quick_settings::GpsState;
 using tdvp::quick_settings::HardwareSnapshot;
 using tdvp::quick_settings::LteSkuState;
 using tdvp::quick_settings::Point;
+using tdvp::quick_settings::PrimaryTile;
 using tdvp::quick_settings::RequestedAction;
 using tdvp::quick_settings::SurfaceTransform;
 
@@ -78,6 +79,28 @@ void test_wifi_status_is_parsed_without_a_desktop_specific_adapter()
     EXPECT(snapshot.wifi_connected);
 }
 
+void test_bluetooth_tile_requires_a_real_provider_control()
+{
+    const HardwareSnapshot enabled = tdvp::quick_settings::parse_status_environment(
+        "bluetooth_available=1\n"
+        "bluetooth_control_available=1\n"
+        "bluetooth_enabled=1\n");
+    const auto enabled_model = tdvp::quick_settings::derive_model(enabled);
+    EXPECT(enabled.bluetooth_available);
+    EXPECT(enabled.bluetooth_control_available);
+    EXPECT(enabled.bluetooth_enabled);
+    EXPECT(enabled_model.show_bluetooth);
+    EXPECT(enabled_model.primary_tile_count == 4U);
+    EXPECT(enabled_model.primary_tiles[1] == PrimaryTile::Bluetooth);
+
+    const HardwareSnapshot unavailable = tdvp::quick_settings::parse_status_environment(
+        "bluetooth_available=1\n"
+        "bluetooth_control_available=0\n");
+    const auto unavailable_model = tdvp::quick_settings::derive_model(unavailable);
+    EXPECT(!unavailable_model.show_bluetooth);
+    EXPECT(unavailable_model.primary_tile_count == 3U);
+}
+
 void test_unsupported_status_never_exposes_gps()
 {
     const HardwareSnapshot snapshot = tdvp::quick_settings::parse_status_environment(
@@ -123,13 +146,17 @@ void test_target_layout_is_touch_safe_and_scroll_free()
 {
     HardwareSnapshot snapshot;
     snapshot.lte_sku = LteSkuState::Present;
+    snapshot.lora_available = true;
+    snapshot.bluetooth_available = true;
+    snapshot.bluetooth_control_available = true;
     const auto model = tdvp::quick_settings::derive_model(snapshot);
     const auto layout = tdvp::quick_settings::make_layout(Extent {1232, 568}, model);
     EXPECT(layout.supported);
     EXPECT(!layout.requires_vertical_scroll);
     EXPECT(layout.fourth_primary_tile == AuxiliaryTile::Gps);
     EXPECT(tdvp::quick_settings::valid_layout(layout, Extent {1232, 568}));
-    EXPECT(layout.primary_cards[0].width == 207);
+    EXPECT(layout.primary_card_count == 5U);
+    EXPECT(layout.primary_cards[0].width == 163);
     EXPECT(layout.primary_cards[0].height == 100);
     EXPECT(layout.sliders[0].width == 426);
     EXPECT(layout.sliders[2].width == 864);
@@ -236,6 +263,7 @@ int main()
     test_no_lte_keyboard_hides_gps();
     test_lte_keyboard_shows_gps();
     test_wifi_status_is_parsed_without_a_desktop_specific_adapter();
+    test_bluetooth_tile_requires_a_real_provider_control();
     test_unsupported_status_never_exposes_gps();
     test_radio_transition_requires_confirmation();
     test_no_lte_keyboard_rejects_gps_control();

@@ -86,7 +86,19 @@ QuickSettingsModel derive_model(const HardwareSnapshot& snapshot)
     model.show_lora = snapshot.lora_available;
     model.show_gps = gps_capable(snapshot.lte_sku);
     model.gps_interactive = model.show_gps;
+    model.show_bluetooth = snapshot.bluetooth_available && snapshot.bluetooth_control_available;
     model.fourth_primary_tile = model.show_gps ? AuxiliaryTile::Gps : AuxiliaryTile::OnScreenKeyboard;
+    const auto add_primary_tile = [&model](PrimaryTile tile) {
+        if (model.primary_tile_count < model.primary_tiles.size())
+            model.primary_tiles[model.primary_tile_count++] = tile;
+    };
+    add_primary_tile(PrimaryTile::Wifi);
+    if (model.show_bluetooth)
+        add_primary_tile(PrimaryTile::Bluetooth);
+    add_primary_tile(PrimaryTile::AudioOutput);
+    if (model.show_lora)
+        add_primary_tile(PrimaryTile::Lora);
+    add_primary_tile(model.show_gps ? PrimaryTile::Gps : PrimaryTile::OnScreenKeyboard);
     model.lora_detail = snapshot.lora_enabled ? "On" : "Off";
     switch (snapshot.lte_sku) {
     case LteSkuState::Present:
@@ -166,6 +178,12 @@ HardwareSnapshot parse_status_environment(std::string_view content)
                 snapshot.wifi_enabled = parse_bool(value);
             else if (key == "wifi_link" || key == "wifi_connected")
                 snapshot.wifi_connected = parse_bool(value);
+            else if (key == "bluetooth_available")
+                snapshot.bluetooth_available = parse_bool(value);
+            else if (key == "bluetooth_control_available")
+                snapshot.bluetooth_control_available = parse_bool(value);
+            else if (key == "bluetooth_enabled" || key == "bluetooth_requested")
+                snapshot.bluetooth_enabled = parse_bool(value);
             else if (key == "lora_control_available" || key == "lora_available")
                 snapshot.lora_available = parse_bool(value);
             else if (key == "lora_requested" || key == "lora_enabled")

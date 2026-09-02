@@ -50,6 +50,7 @@ QuickSettingsLayout make_layout(Extent display, const QuickSettingsModel& model)
 {
     QuickSettingsLayout layout;
     layout.fourth_primary_tile = model.fourth_primary_tile;
+    layout.primary_card_count = model.primary_tile_count;
     if (display.width != kTargetWidth ||
         (display.height != kTargetHeight && display.height != kAvailableHeightBelowPanel))
         return layout;
@@ -72,10 +73,17 @@ QuickSettingsLayout make_layout(Extent display, const QuickSettingsModel& model)
     layout.status_bar = row_rect(0, 0, kTargetWidth, kStatusHeight);
     layout.drawer = row_rect(0, kStatusHeight, kTargetWidth, display.height - kStatusHeight);
 
-    const int primary_width = (kMainWidth - (3 * kCardGap)) / 4;
-    for (int index = 0; index < 4; ++index)
+    if (layout.primary_card_count == 0U ||
+        layout.primary_card_count > layout.primary_cards.size()) {
+        layout.supported = false;
+        return layout;
+    }
+    const int primary_width =
+        (kMainWidth - static_cast<int>((layout.primary_card_count - 1U) * kCardGap)) /
+        static_cast<int>(layout.primary_card_count);
+    for (std::size_t index = 0; index < layout.primary_card_count; ++index)
         layout.primary_cards[static_cast<std::size_t>(index)] =
-            row_rect(kOuterMargin + index * (primary_width + kCardGap), primary_y, primary_width,
+            row_rect(kOuterMargin + static_cast<int>(index) * (primary_width + kCardGap), primary_y, primary_width,
                      primary_height);
 
     // Two broad top-row controls and one full-width keyboard-light control are
@@ -125,8 +133,13 @@ bool valid_layout(const QuickSettingsLayout& layout, Extent display)
             return rect.fits_within(display.width, display.height) && rect.width >= 48 && rect.height >= 48;
         });
     };
-    return all_fit(layout.primary_cards) && all_fit(layout.sliders) && all_fit(layout.secondary_actions) &&
-           all_fit(layout.system_actions) && all_fit(layout.network_rows);
+    for (std::size_t index = 0; index < layout.primary_card_count; ++index) {
+        const Rect& card = layout.primary_cards[index];
+        if (!card.fits_within(display.width, display.height) || card.width < 48 || card.height < 48)
+            return false;
+    }
+    return all_fit(layout.sliders) && all_fit(layout.secondary_actions) && all_fit(layout.system_actions) &&
+           all_fit(layout.network_rows);
 }
 
 }  // namespace tdvp::quick_settings
