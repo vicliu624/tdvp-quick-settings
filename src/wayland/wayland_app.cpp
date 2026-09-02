@@ -241,6 +241,91 @@ void draw_slider(cairo_t* context, const Rect& rect, const char* title, int perc
     cairo_fill(context);
 }
 
+// The keyboard backlight is a PWM-driven LED rail with a handful of visually
+// distinct levels, rather than a perceptually continuous analogue control.
+// Expose those levels as direct-touch presets so the UI does not promise a
+// degree of precision the hardware cannot show.
+constexpr std::array<int, 3> kKeyboardBacklightPresetPercents {{0, 33, 100}};
+constexpr std::array<const char*, 3> kKeyboardBacklightPresetLabels {{"Off", "Dim", "Bright"}};
+
+[[nodiscard]] int keyboard_backlight_preset_index(int percent)
+{
+    percent = std::max(0, std::min(100, percent));
+    int closest = 0;
+    int smallest_distance = std::abs(percent - kKeyboardBacklightPresetPercents[0]);
+    for (std::size_t index = 1; index < kKeyboardBacklightPresetPercents.size(); ++index) {
+        const int distance = std::abs(percent - kKeyboardBacklightPresetPercents[index]);
+        if (distance < smallest_distance) {
+            closest = static_cast<int>(index);
+            smallest_distance = distance;
+        }
+    }
+    return closest;
+}
+
+[[nodiscard]] Rect keyboard_backlight_preset_rect(const Rect& card, std::size_t index)
+{
+    constexpr int kInset = 18;
+    constexpr int kGap = 8;
+    const int width = (card.width - 2 * kInset -
+                       static_cast<int>((kKeyboardBacklightPresetPercents.size() - 1U) * kGap)) /
+                      static_cast<int>(kKeyboardBacklightPresetPercents.size());
+    return Rect {card.x + kInset + static_cast<int>(index) * (width + kGap), card.y + 34, width,
+                 card.height - 42};
+}
+
+void draw_keyboard_backlight_presets(cairo_t* context, const Rect& rect, int percent)
+{
+    // This is deliberately not draw_card(): that helper puts a normal card
+    // title at y+37, where the preset buttons live on this compact row.
+    draw_rounded_rect(context, rect, 10.0);
+    cairo_set_source_rgb(context, 0.98, 0.97, 0.94);
+    cairo_fill_preserve(context);
+    cairo_set_source_rgb(context, 0.63, 0.59, 0.52);
+    cairo_set_line_width(context, 1.2);
+    cairo_stroke(context);
+
+    const int selected = keyboard_backlight_preset_index(percent);
+    const std::string selected_text =
+        std::string(kKeyboardBacklightPresetLabels[static_cast<std::size_t>(selected)]) + " " +
+        std::to_string(kKeyboardBacklightPresetPercents[static_cast<std::size_t>(selected)]) + "%";
+    cairo_set_source_rgb(context, 0.16, 0.16, 0.14);
+    draw_text(context, static_cast<double>(rect.x + 18), static_cast<double>(rect.y + 24), 16.0,
+              "Keyboard Backlight", true);
+    cairo_set_source_rgb(context, 0.31, 0.30, 0.27);
+    draw_text(context, static_cast<double>(rect.x + rect.width - 102),
+              static_cast<double>(rect.y + 24), 14.0, selected_text.c_str(), true);
+
+    for (std::size_t index = 0; index < kKeyboardBacklightPresetPercents.size(); ++index) {
+        const Rect preset = keyboard_backlight_preset_rect(rect, index);
+        const bool active = static_cast<int>(index) == selected;
+        draw_rounded_rect(context, preset, 7.0);
+        if (active)
+            cairo_set_source_rgb(context, 0.18, 0.18, 0.16);
+        else
+            cairo_set_source_rgb(context, 0.92, 0.90, 0.86);
+        cairo_fill_preserve(context);
+        cairo_set_source_rgb(context, active ? 0.90 : 0.72, active ? 0.31 : 0.68,
+                             active ? 0.12 : 0.60);
+        cairo_set_line_width(context, 1.0);
+        cairo_stroke(context);
+        cairo_set_source_rgb(context, active ? 0.98 : 0.16, active ? 0.97 : 0.16,
+                             active ? 0.92 : 0.14);
+        draw_text(context, static_cast<double>(preset.x + 14),
+                  static_cast<double>(preset.y + preset.height / 2 + 5), 14.0,
+                  kKeyboardBacklightPresetLabels[index], true);
+    }
+}
+
+[[nodiscard]] int keyboard_backlight_preset_at(const Rect& card, int pointer_x, int pointer_y)
+{
+    for (std::size_t index = 0; index < kKeyboardBacklightPresetPercents.size(); ++index) {
+        if (keyboard_backlight_preset_rect(card, index).contains(pointer_x, pointer_y))
+            return static_cast<int>(index);
+    }
+    return -1;
+}
+
 int clamp_percent(int value)
 {
     return std::max(0, std::min(100, value));
@@ -1407,7 +1492,10 @@ private:
                 continue;
             }
             paint_snapshot_region(context, rect);
-            draw_slider(context, rect, titles[index], values[index], active);
+            if (index == 2U)
+                draw_keyboard_backlight_presets(context, rect, values[index]);
+            else
+                draw_slider(context, rect, titles[index], values[index], active);
             buffer.slider_values[index] = values[index];
             buffer.slider_active[index] = active;
             damage.include(rect);
@@ -1555,9 +1643,8 @@ private:
         draw_slider(context, layout.sliders[1], "Screen Brightness",
                     snapshot_.display_brightness_percent,
                     active_slider_ == 1);
-        draw_slider(context, layout.sliders[2], "Keyboard Backlight",
-                    snapshot_.keyboard_backlight_percent,
-                    active_slider_ == 2);
+        draw_keyboard_backlight_presets(context, layout.sliders[2],
+                                        snapshot_.keyboard_backlight_percent);
         draw_card(context, layout.secondary_actions[0], snapshot_.muted ? "Unmute" : "Mute", "Audio control");
         draw_card(context, layout.secondary_actions[1], "Settings", "System settings");
         draw_card(context, layout.system_actions[0], "Lock", "Lock session");
@@ -1682,7 +1769,9 @@ private:
         const QuickSettingsLayout layout = make_layout(Extent {width_, height_}, model);
         if (!layout.supported)
             return -1;
-        for (std::size_t index = 0; index < layout.sliders.size(); ++index) {
+        // Volume and display brightness remain continuous drags.  Keyboard
+        // illumination is a discrete preset control handled on touch-up.
+        for (std::size_t index = 0; index < 2U; ++index) {
             if (layout.sliders[index].contains(pointer_x, pointer_y))
                 return static_cast<int>(index);
         }
@@ -2030,6 +2119,29 @@ private:
         redraw();
     }
 
+    void select_keyboard_backlight_preset(int preset)
+    {
+        if (preset < 0 ||
+            static_cast<std::size_t>(preset) >= kKeyboardBacklightPresetPercents.size()) {
+            return;
+        }
+        const ProviderReply reply = provider_.request(
+            "SET keyboard-backlight " +
+            std::to_string(kKeyboardBacklightPresetPercents[static_cast<std::size_t>(preset)]));
+        if (reply.ok) {
+            // This action can only change the keyboard PWM route.  Keep the
+            // already-cached static scene and each buffer's revealed height;
+            // render_dynamic_sliders() will repaint just this card.  Calling
+            // execute_provider() here would invalidate both back buffers and
+            // force a full-drawer redraw, visibly flashing the whole screen.
+            snapshot_.keyboard_backlight_percent = reply.snapshot.keyboard_backlight_percent;
+            message_.clear();
+        } else {
+            message_ = reply.error;
+        }
+        redraw();
+    }
+
     void execute_radio_action(RequestedAction action, bool confirmed)
     {
         const ActionOutcome planned = plan_action(snapshot_, action, confirmed);
@@ -2127,7 +2239,8 @@ private:
             execute_provider("SET display-brightness " + std::to_string(slider_percent(layout.sliders[1], pointer_x)));
             return;
         } else if (layout.sliders[2].contains(pointer_x, pointer_y)) {
-            execute_provider("SET keyboard-backlight " + std::to_string(slider_percent(layout.sliders[2], pointer_x)));
+            const int preset = keyboard_backlight_preset_at(layout.sliders[2], pointer_x, pointer_y);
+            select_keyboard_backlight_preset(preset);
             return;
         } else if (layout.secondary_actions[0].contains(pointer_x, pointer_y)) {
             execute_provider("SET speaker-mute toggle");
